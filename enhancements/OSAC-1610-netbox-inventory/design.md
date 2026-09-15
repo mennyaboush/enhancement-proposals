@@ -28,7 +28,8 @@ Deployment is in-tree (compiled into the operator) following established pattern
 ### Goals
 
 - Implement the `inventory.Client` interface for NetBox, following existing backend patterns.
-- Prevent double-allocation of hosts via atomic assignment in NetBox with read-then-verify-after-write pattern.
+
+- Prevent double-allocation of hosts via atomic assignment in NetBox with ETag-based optimistic locking (If-Match on PATCH; 412 Precondition Failed on conflict).
 - Track allocation state in NetBox via `osac_instance_id` custom field for crash recovery and idempotency.
 - Support label-based host selection via NetBox device attributes with permissive client-side matching (consistent with BCM extra_values model).
 - Enable Helm + Enclave Wizard configuration of NetBox endpoint, credentials, and TLS certificates without exposing secrets in logs or error messages.
@@ -47,7 +48,7 @@ Deployment is in-tree (compiled into the operator) following established pattern
 NetBox backend is implemented in `bare-metal-fulfillment-operator/internal/inventory/netbox.go`, extending the existing registry pattern in `inventory.go`. A new `NetBoxClient` struct implements the `Client` interface with the following methods:
 
 - **`FindFreeHost(ctx, matchExpressions)`** — Query NetBox for devices matching label selectors; return a candidate with no active assignment.
-- **`AssignHost(ctx, inventoryHostID, bareMetalInstanceID, labels)`** — Atomically mark a device as assigned in NetBox; idempotent for crash recovery.
+- **`AssignHost(ctx, inventoryHostID, bareMetalInstanceID, labels)`** — Atomically mark a device as assigned in NetBox using ETag-based optimistic locking; idempotent for crash recovery.
 - **`UnassignHost(ctx, inventoryHostID, labels)`** — Clear assignment marker from NetBox device; idempotent.
 - **`GetHostNICs(ctx, inventoryHostID)`** — Retrieve NIC information from the Metal3 BareMetalHost CR created during AssignHost by querying its hardware inspection data. Returns (nil, nil) when hardware inspection has not yet completed; actual NIC discovery happens in the provisioning layer.
 
@@ -245,17 +246,18 @@ After fetching unassigned devices, filter in the operator code by tenant label s
 - Authentication: Bearer token in `Authorization: Token <token>` header
 - TLS validation: system CA bundle + optional custom CA cert (injected into http.Client Transport)
 - Timeout: 30s per request (configurable)
-- Retry logic: transient errors (5xx, network) up to 3 times; permanent errors (401, 403, 4xx validation) fail fast
+- Retry logic: transient errors (5xx, network) up to 3 times; 412 Precondition Failed triggers race-loss path (not retried as transient — handled by caller); permanent errors (401, 403, 4xx validation) fail fast
 
 **Key Endpoints:**
 - `GET /api/dcim/devices/` — List devices with filters (pool tag, status, assignment field)
-- `GET /api/dcim/devices/{id}/` — Fetch single device (verify read-after-write during assignment)
-- `PATCH /api/dcim/devices/{id}/` — Update device `osac_instance_id` field during assignment/unassignment
+- `GET /api/dcim/devices/{id}/` — Fetch single device; response includes ETag header for optimistic locking
+- `PATCH /api/dcim/devices/{id}/` — Update device `osac_instance_id` field during assignment/unassignment. Sends `If-Match` header with ETag from prior GET to detect concurrent modifications (412 Precondition Failed on conflict)
 
 **Error Handling:**
 - 401 Unauthorized — Secret validation failure; permanent; actionable message
 - 403 Forbidden — Token lacks permissions; permanent; actionable message
-- 4xx validation — Invalid query/filter; permanent; actionable message (must include field names for debugging)
+- 4xx validation (excluding 412) — Invalid query/filter; permanent; actionable message (must include field names for debugging)
+- 412 Precondition Failed — Concurrent modification detected (ETag mismatch); another operator or process modified the device since our last GET. In AssignHost: return (nil, nil) — treat as race loss. In UnassignHost: re-read device and retry from step 1.
 - 5xx server error — Transient; retry with backoff
 - Network error (timeout, connection refused) — Transient; retry with backoff
 
@@ -281,13 +283,13 @@ No secrets or tenant data logged. Error messages use generic "unable to contact 
 ### AssignHost Implementation
 
 **Normal Path (Happy Case):**
-1. Read device from NetBox by ID and check assignment status:
+1. Read device from NetBox by ID and check assignment status. **Capture the ETag header from the response.**
    - If already assigned to **same ID** → return (host, Ready status) — skip to readiness check
    - If assigned to **different ID** → return (nil, nil) — another request won the race
    - If unassigned → proceed to step 2
 2. Extract BMC credentials: read `bmc_username`, `bmc_password`, `bmc_address` from device custom fields
-3. PATCH assignment: update NetBox device with `osac_instance_id = bareMetalInstanceID`
-4. Verify write: read device back; confirm `osac_instance_id` matches (strong consistency check for race conditions)
+3. PATCH assignment: update NetBox device with `osac_instance_id = bareMetalInstanceID`. **Include `If-Match: <etag>` header from step 1.** If NetBox returns **412 Precondition Failed** → another process modified the device since our read; return (nil, nil) — treat as race loss.
+4. Verify write (sanity check): read device back; confirm `osac_instance_id` matches. This is now a safety net rather than the primary race detection mechanism — the ETag in step 3 prevents concurrent overwrites.
 5. Create BMC Secret: create Kubernetes Secret with extracted BMC credentials
 6. Create BMH: call `bmhManager.CreateBMH()` to create Metal3 BareMetalHost CR (idempotent)
 7. Check readiness: query BMH status; return `Host.Ready = true/false`
@@ -298,11 +300,14 @@ No secrets or tenant data logged. Error messages use generic "unable to contact 
 - If assigned to different ID → return (nil, nil) without writing
 - This makes the entire flow idempotent across retries, transient failures, and crashes
 
-**Race Condition Handling (Concurrent Requests):**
+**Race Condition Handling (Concurrent Requests with ETag Protection):**
 - BareMetalInstance A and B both call `FindFreeHost` → same device returned to both
-- A's `AssignHost` succeeds first (PATCH + verify write)
-- B's `AssignHost` reads device (step 1), sees `osac_instance_id ≠ B_ID` → returns (nil, nil)
-- B's caller retries `FindFreeHost`; gets different device or nil
+- A's `AssignHost` reads device (step 1), captures ETag_v1
+- B's `AssignHost` reads device (step 1), captures ETag_v1
+- A's PATCH includes `If-Match: ETag_v1` → succeeds (first writer wins); NetBox updates device and returns new ETag_v2
+- B's PATCH includes `If-Match: ETag_v1` → fails with 412 Precondition Failed (device was modified since B's read)
+- B's `AssignHost` returns (nil, nil); caller retries `FindFreeHost`
+- Result: true first-writer-wins semantics; no silent overwrites; race detected at PATCH time, not at verify-read time
 
 **Transient Failure Recovery (PATCH Fails):**
 - PATCH fails with 5xx, timeout, or network error
@@ -324,12 +329,12 @@ No secrets or tenant data logged. Error messages use generic "unable to contact 
 ### UnassignHost Implementation
 
 **Normal Path (Happy Case):**
-1. Read device and check assignment:
+1. Read device and check assignment. **Capture the ETag header.**
    - If `osac_instance_id` is empty → return success (already unassigned)
    - If has **different assignment** → return success (not ours; don't touch)
    - If has **matching assignment** → proceed to step 2
-2. Clear assignment: PATCH NetBox to clear `osac_instance_id`
-3. Verify write: read device back; confirm field is cleared
+2. Clear assignment: PATCH NetBox to clear `osac_instance_id`. **Include `If-Match: <etag>` header from step 1.** If NetBox returns **412 Precondition Failed** → re-read device and retry from step 1 (another process modified the device concurrently).
+3. Verify write (sanity check): read device back; confirm field is cleared
 4. Delete BMH: call `bmhManager.DeleteBMH()` to remove Metal3 BareMetalHost CR
 5. Delete Secret: call `bmhManager.DeleteBMCSecret()` to remove BMC credentials
 
@@ -337,6 +342,7 @@ No secrets or tenant data logged. Error messages use generic "unable to contact 
 - Same read-first pattern as AssignHost
 - Every retry starts by checking device state
 - Safe for multiple retries without duplicate writes
+- ETag-based `If-Match` on PATCH prevents concurrent modification; 412 triggers re-read and retry (safe because unassignment is idempotent)
 
 ### Metal3 BareMetalHost Lifecycle
 
