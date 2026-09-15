@@ -695,7 +695,7 @@ Decision impacts:
 - **Device with wrong tags:** Mock NetBox returns empty list (server-side filtering); tenant requests gpu_model=V100 but no devices have osac-gpu-model-v100 → nil returned
 - **Superset match:** Device has tags [osac-cpu-cores-16, osac-gpu-model-a100, osac-memory-gb-128]; tenant requests only cpu_cores=16 → device IS returned (extra tags are fine)
 - No devices match device selection tag → nil
-- All active devices assigned → nil
+- All staged devices assigned → nil
 - Large result set (100+ devices) → pagination handled correctly
 
 **Capacity Count Query:**
