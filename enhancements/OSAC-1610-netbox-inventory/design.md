@@ -31,7 +31,7 @@ Deployment is in-tree (compiled into the operator) following established pattern
 
 - Prevent double-allocation of hosts via atomic assignment in NetBox with ETag-based optimistic locking (If-Match on PATCH; 412 Precondition Failed on conflict).
 - Track allocation state in NetBox via `osac_instance_id` custom field for crash recovery and idempotency.
-- Support label-based host selection via NetBox device attributes with permissive client-side matching (consistent with BCM extra_values model).
+- Support label-based host selection via NetBox tags (server-side filtering with AND semantics across tags).
 - Enable Helm + Enclave Wizard configuration of NetBox endpoint, credentials, and TLS certificates without exposing secrets in logs or error messages.
 - Maintain tenant transparency — allocation/deallocation workflows identical across all backends; no NetBox-specific UX.
 
@@ -47,7 +47,7 @@ Deployment is in-tree (compiled into the operator) following established pattern
 
 NetBox backend is implemented in `bare-metal-fulfillment-operator/internal/inventory/netbox.go`, extending the existing registry pattern in `inventory.go`. A new `NetBoxClient` struct implements the `Client` interface with the following methods:
 
-- **`FindFreeHost(ctx, matchExpressions)`** — Query NetBox for devices matching label selectors; return a candidate with no active assignment.
+- **`FindFreeHost(ctx, matchExpressions)`** — Query NetBox for unassigned pool devices filtered by hardware label tags (server-side); return first matching candidate or nil.
 - **`AssignHost(ctx, inventoryHostID, bareMetalInstanceID, labels)`** — Atomically mark a device as assigned in NetBox using ETag-based optimistic locking; idempotent for crash recovery.
 - **`UnassignHost(ctx, inventoryHostID, labels)`** — Clear assignment marker from NetBox device; idempotent.
 - **`GetHostNICs(ctx, inventoryHostID)`** — Retrieve NIC information from the Metal3 BareMetalHost CR created during AssignHost by querying its hardware inspection data. Returns (nil, nil) when hardware inspection has not yet completed; actual NIC discovery happens in the provisioning layer.
@@ -65,11 +65,11 @@ The backend uses NetBox's native device model and REST API. Host allocation stat
 #### Cloud Infrastructure Admin: Configure NetBox Backend
 
 1. **Prerequisite:** Devices exist in NetBox with:
-   - Capability labels/attributes (stored in custom field `osac_labels`)
+   - Hardware label tags in osac-<key>-<value> format (e.g., osac-cpu-cores-16, osac-gpu-model-a100, osac-memory-gb-128). Tags must be pre-created in NetBox before applying to devices.
    - BMC credentials (stored in custom fields, e.g., `bmc_username`, `bmc_password`, `bmc_address`)
    - Tag `managed_by:osac` applied (identifies devices available for OSAC allocation)
    - Status set to `staged` (ready for allocation)
-   - Custom fields pre-created: `osac_instance_id` (string, nullable) and `osac_labels` (JSON or text)
+   - Custom field pre-created: `osac_instance_id` (string, nullable)
 
 2. **Create Secret** (one-time setup):
    ```bash
@@ -125,9 +125,9 @@ The backend uses NetBox's native device model and REST API. Host allocation stat
      - If `AssignHost` returns (host, Ready) → device is ours; proceed to provisioning
      - If `AssignHost` returns (nil, nil) → device was claimed by another request during a prior crash window; clear `ExternalHostID` and fall through to `FindFreeHost` below
    - Extract hardware requirements from the instance_type specification (CPU cores, memory, GPU, etc.)
-   - Query NetBox for unassigned devices in the pool (tag=managed_by:osac, status=staged, osac_instance_id empty)
-   - Filter results in operator code by tenant label selectors (e.g., cpu_cores: "16", gpu_model: "A100")
-   - Call `FindFreeHost` with first matching candidate → returns host or nil
+   - Convert tenant label selectors from instance_type to tag slugs (e.g., cpu_cores=16 → osac-cpu-cores-16)
+   - Query NetBox for unassigned devices matching device tag AND all hardware label tags (server-side filtering): tag=managed_by:osac, tag=osac-cpu-cores-16, tag=osac-gpu-model-a100, status=staged, osac_instance_id__empty=true
+   - Call `FindFreeHost` with first result → returns host or nil
    - If nil: requeue with exponential backoff; tenant sees "No hosts available"
    - If found: record `ExternalHostID` in BareMetalInstance CR status (persist the candidate device ID BEFORE assignment)
    - Call `AssignHost` on the candidate device
@@ -197,10 +197,10 @@ type NetBoxConfig struct {
 
 Configuration is unmarshaled from YAML in a Kubernetes Secret mounted at `OSAC_INVENTORY_CONFIG_PATH`. Helm charts and Enclave Wizard pipeline process user input into this structure. [Locked: D2]
 
-**Hardcoded Conventions:** Pool selection tag and device label field names are not configurable; OSAC uses fixed names to maintain consistent conventions across all deployments:
-- Pool tag: `managed_by:osac` (Cloud Infrastructure Admin must create this tag in NetBox and apply it to allocable devices)
-- Device label field: `osac_labels` (Cloud Infrastructure Admin must create this custom field in NetBox)
-- Allocation tracking field: `osac_instance_id` (automatically managed by operator; admin must create as string, nullable custom field in NetBox)
+**Hardcoded Conventions:** Device selection tag and hardware label tag format are not configurable; OSAC uses fixed names to maintain consistent conventions across all deployments:
+- Device selection tag: `managed_by:osac` (identifies OSAC-managed devices)
+- Allocation tracking field: `osac_instance_id` (...)
+- Hardware label tags: osac-<key>-<value> format (e.g., osac-cpu-cores-16, osac-gpu-model-a100). Tags are indexed in NetBox and used for server-side filtering during FindFreeHost queries.
 
 ### Allocation Tracking and Device Filtering
 
@@ -216,27 +216,37 @@ A custom field `osac_instance_id` (string, nullable) on each device stores the B
 
 **FindFreeHost Query:**
 
+The query combines device selection filters with tenant hardware label tags:
+
 ```
-GET /api/dcim/devices/?tag=managed_by:osac&status=staged&osac_instance_id__empty=true&limit=100&offset=0
+GET /api/dcim/devices/?tag=managed_by:osac&tag=osac-cpu-cores-16&tag=osac-gpu-model-a100
+&status=staged&osac_instance_id__empty=true&limit=100&offset=0
 ```
 
-This single NetBox query returns only devices that:
-- Have the pool tag (membership)
-- Have `staged` status (physically installed and ready)
-- Have empty `osac_instance_id` (unassigned)
+All filters are server-side and indexed:
 
-NetBox handles pagination; operator iterates through results with `limit` and `offset` parameters.
+| Filter parameter               | Purpose                           |
+|--------------------------------|-----------------------------------|
+| tag=managed_by:osac            | Device membership                 |
+| tag=osac-<key>-<value> (×N)    | Hardware label matching (AND)     |
+| status=staged                  | Readiness for allocation          |
+| osac_instance_id__empty=true   | Unassigned devices only           |
 
-**Label Matching:**
+Multiple tag= parameters use AND semantics — only devices matching ALL specified tags are returned.
 
-After fetching unassigned devices, filter in the operator code by tenant label selectors (custom field values are not efficiently queryable in NetBox API, so application-side filtering is simpler and avoids expensive queries).
+The tenant's label selectors (from the BareMetalInstance instance_type spec) are converted to tag slugs before query construction:
+```
+Input: {"cpu_cores": "16", "gpu_model": "A100"}
+Slugified: ["osac-cpu-cores-16", "osac-gpu-model-a100"]
+Query params: &tag=osac-cpu-cores-16&tag=osac-gpu-model-a100
+```
 
 **Advantages:**
-- Pool tag (`managed_by`) identifies which pool each device belongs to
-- `osac_instance_id` field is orthogonal to device status (offline/active/planned/staged/failed) — allocation tracking doesn't interfere with operational state
-- Human-readable; easy to diagnose which instance owns each device
-- Queryable at API level for unassigned devices
-- Survives device edits and external CI system updates
+- Server-side filtering: only matching devices returned by NetBox; reduced network payload
+- No client-side label parsing or matching code
+- Tags are indexed — efficient even with large device counts
+- Consistent tag pattern: managed_by:osac for device membership, osac-<key>-<value> for hardware labels
+- ETag protection covers tag modifications identically to custom field modifications
 
 ### NetBox REST API Interactions
 
@@ -263,22 +273,32 @@ After fetching unassigned devices, filter in the operator code by tenant label s
 
 No secrets or tenant data logged. Error messages use generic "unable to contact inventory backend" when exposing would leak information.
 
-### Label Matching Strategy
+#### Label Matching Strategy
 
-[Codebase: bare-metal-fulfillment-operator/internal/inventory/] Consistent with BCM `extra_values` model: client-side permissive matching. NetBox stores device attributes as tags, custom fields, or metadata; OSAC retrieves device metadata and evaluates selectors locally.
+**Approach: Server-side tag filtering**
 
-**Matching Contract:**
-- Tenant provides: `{"cpu_cores": "16", "memory_gb": "64"}` as key=value pairs
-- NetBox device has metadata: `{"osac_labels": {"cpu_cores": "16", "memory_gb": "64", "architecture": "x86_64"}}`
-- Match logic: all tenant keys present in device metadata with matching values → host candidate
-- Reserved keys (excluded from matching): `osac_instance_id`, `managedBy`, `provisionState`
-- Validation: permissive; no strict K8s label syntax enforcement (e.g., allow spaces in values)
+Hardware labels are stored as NetBox tags in osac-<key>-<value> format. Label matching is performed entirely server-side by including tenant label selectors as tag query parameters in the FindFreeHost API call. NetBox applies AND semantics on multiple tag= parameters, returning only devices that match all requested labels.
 
-**Query Optimization:**
-- FindFreeHost does NOT send per-label filters to NetBox (labels are custom fields, not queryable efficiently)
-- Instead: fetch all active devices in pool without assignment → filter locally by labels
-- Rationale: custom field queries via API are cumbersome; client-side filtering is simpler and more flexible
-- Pagination: handle large device counts via limit/offset (e.g., fetch 100 at a time)
+**Why tags over custom fields:**
+- Tags are indexed in NetBox; custom field values (especially JSON sub-keys) are not efficiently queryable via the API
+- Server-side filtering reduces network payload and eliminates client-side matching code
+- ETag-based optimistic locking protects tag modifications identically to custom field modifications
+- Each inventory backend optimizes for its own capabilities; the inventory.Client interface abstracts the matching strategy
+
+**Matching contract:**
+- Tenant provides: key=value label selectors from instance_type (e.g., cpu_cores=16, gpu_model=A100)
+- Operator converts each to tag slug: osac-<key>-<value> (e.g., osac-cpu-cores-16, osac-gpu-model-a100)
+- NetBox API returns only devices matching ALL requested tags
+- A device with EXTRA tags beyond those requested is still a valid match (superset matching)
+
+**Tag slug rules:**
+- Format: osac-<key>-<value>
+- Characters allowed: [a-z0-9-] only (lowercase alphanumeric and hyphens)
+- Key underscores become hyphens (cpu_cores → cpu-cores)
+- Values are lowercased and slugified (A100 → a100)
+- Label keys and values that cannot be slugified are rejected at the API level with a validation error
+
+**Validation:** strict slug-safe enforcement. Label keys and values must contain only alphanumeric characters, underscores, and hyphens. Spaces and special characters are rejected.
 
 ### AssignHost Implementation
 
@@ -411,7 +431,7 @@ management:
 Enclave Wizard pipeline:
 1. Accepts user input (NetBox endpoint, credentials, Metal3 namespace)
 2. Creates Kubernetes Secret with NetBox API token
-3. Validates NetBox connectivity and schema (custom fields exist)
+3. Validates NetBox connectivity and schema: confirms osac_instance_id custom field exists; verifies managed_by:osac device selection tag is defined
 4. Validates Metal3 availability (BareMetalHost CRD installed)
 5. Generates values.yaml with resolved configuration
 6. Helm chart deploys operator with both inventory and management backends configured
@@ -440,18 +460,24 @@ Tenant users cannot see which backend is in use or any NetBox state; allocation 
 
 ### Input Validation
 
-Label selectors from BareMetalInstance API are user-provided key=value pairs. Matching is client-side and uses permissive validation (not strict K8s label syntax). No injection risk because:
-- Filters are constructed locally; not interpolated into NetBox queries
-- Custom field queries are constructed via URL parameters (not free-form input)
-- Label values compared as strings; no code execution
+Label selectors from BareMetalInstance API are user-provided key=value pairs. These are converted to tag slugs and included in NetBox API query URLs. Input validation requirements:
+
+- Keys and values must match [a-zA-Z0-9_-]+ (alphanumeric, underscores, hyphens only)
+- Values are lowercased and slugified before query construction
+- Keys with underscores are converted to hyphens in the slug
+- Any label key or value containing characters outside the allowed set is rejected with a validation error before any NetBox query is made
+- The osac- prefix is added by the operator, never by the tenant — tenants provide raw key=value pairs (e.g., cpu_cores=16), not tag slugs (e.g., osac-cpu-cores-16)
+- URL encoding is applied to the final query string to prevent injection via special characters in tag parameters
 
 NetBox queries constructed defensively:
 ```go
 // Safe: URL parameters are URL-encoded by http.Client
 params := url.Values{}
-params.Add("status", "active")
+params.Add("tag", "managed_by:osac")
+params.Add("tag", "osac-cpu-cores-16")
+params.Add("status", "staged")
 params.Add("osac_instance_id__empty", "true")
-// Result: status=active&osac_instance_id__empty=true
+// Result: tag=managed_by:osac&tag=osac-cpu-cores-16&status=staged&osac_instance_id__empty=true
 ```
 
 ### Authorization
@@ -517,7 +543,7 @@ New Prometheus metrics emitted by NetBox backend:
 
 | Metric | Type | Labels | Meaning |
 |--------|------|--------|---------|
-| `osac_netbox_hosts_available` | gauge | `host_class` | Number of unassigned NetBox devices by host class (sampled each FindFreeHost call) |
+| `osac_netbox_hosts_available` | gauge | `host_class` | Total count of unassigned staged devices in the pool (tag=managed_by:osac, status=staged, osac_instance_id empty); sampled via dedicated capacity count query to NetBox (independent of tenant label filters) |
 | `osac_netbox_assignment_attempts_total` | counter | `result` | Total AssignHost attempts; result = success/race/error |
 | `osac_netbox_api_errors_total` | counter | `error_type` | Total API errors by type (401, 403, 5xx, timeout) |
 
@@ -525,8 +551,8 @@ New Prometheus metrics emitted by NetBox backend:
 
 Controller logs include:
 - `host_search_label_selector` — labels requested by tenant
-- `matched_hosts_count` — number of candidates after label filtering
-- `assigned_hosts_count` — number of candidates already assigned
+- `label_tags_queried` — tag slugs sent to NetBox for this tenant's request (e.g., ["osac-cpu-cores-16", "osac-gpu-model-a100"])
+- `matching_devices_count` — count of devices returned by NetBox matching this tenant's label tags
 - `selected_host_id` — NetBox device ID selected (if non-nil)
 - `assignment_id` — BareMetalInstance UID assigned to device
 - `netbox_api_error` — error type/code (never token value or full response)
@@ -641,43 +667,105 @@ Decision impacts:
 - Parse config with missing endpoint; assert error
 - Parse config with invalid token Secret reference; assert error
 - TLS certificate loading from Secret; assert correct CA added to http.Client
+- **Tag slug generation from config:**
+  - Setup: Tenant instance_type has labels: {"cpu_cores": "16", "GPU_Model": "A100", "arch": "x86_64"}
+  - Action: Operator converts to tag slugs
+  - Expected: ["osac-cpu-cores-16", "osac-gpu-model-a100", "osac-arch-x86-64"]
+- **Tag slug validation rejects invalid characters:**
+  - Setup: Label value contains spaces: {"desc": "big server"}
+  - Action: Operator attempts slug conversion
+  - Expected: Validation error before any NetBox query; BareMetalInstance status shows error message
 
-**Label Matching:**
-- Match expression `{cpu_cores: "16", memory_gb: "64"}` against device with matching labels → match
-- Device missing one label → no match
-- Device with extra labels → match (permissive)
-- Reserved keys (osac_instance_id, managedBy) excluded from matching
-- Empty match expressions → all unlabeled devices match (edge case)
+**Label Matching → Tag Query Construction (Unit Tests):**
+- Input: {"cpu_cores": "16", "gpu_model": "A100"}
+  Expected tags: ["osac-cpu-cores-16", "osac-gpu-model-a100"]
+- Input: {"memory_gb": "128"}
+  Expected tags: ["osac-memory-gb-128"]
+- Input: {"key_with_underscores": "value"}
+  Expected tags: ["osac-key-with-underscores-value"]
+- Input: {"key": "UPPERCASE_Value"}
+  Expected tags: ["osac-key-uppercase-value"]
+- Input: {"invalid key!": "value"}
+  Expected: validation error (invalid characters)
+- Input: {"key": "value with spaces"}
+  Expected: validation error (invalid characters)
 
 **FindFreeHost Logic:**
-- Query returns 5 active devices; 2 already assigned; FindFreeHost returns unassigned candidate or nil
-- No devices match pool label → nil
+- **Device with matching tags:** Mock NetBox returns device with tags [managed_by:osac, osac-cpu-cores-16]; tenant requests cpu_cores=16 → device is returned
+- **Device with wrong tags:** Mock NetBox returns empty list (server-side filtering); tenant requests gpu_model=V100 but no devices have osac-gpu-model-v100 → nil returned
+- **Superset match:** Device has tags [osac-cpu-cores-16, osac-gpu-model-a100, osac-memory-gb-128]; tenant requests only cpu_cores=16 → device IS returned (extra tags are fine)
+- No devices match device selection tag → nil
 - All active devices assigned → nil
-- Label mismatch → nil
 - Large result set (100+ devices) → pagination handled correctly
+
+**Capacity Count Query:**
+- **Test 1 — Count returns correct number:**
+  - Setup: Mock NetBox with 5 devices matching device selection filters (tag=managed_by:osac, status=staged, osac_instance_id empty)
+  - Action: Capacity count query with brief=true&limit=1
+  - Expected: Response JSON has "count": 5; results array has exactly 1 device (brief format)
+- **Test 2 — Count updates after assignment:**
+  - Setup: 5 available devices; AssignHost one device
+  - Action: Re-run capacity count query
+  - Expected: "count": 4 (one fewer available)
+- **Test 3 — Count with no available devices:**
+  - Setup: All devices have osac_instance_id set
+  - Action: Capacity count query
+  - Expected: "count": 0; results array empty
 
 **AssignHost Idempotency:**
 - Assign host → device now has osac_instance_id; read-after-write confirms
 - Assign same host with same ID again → idempotent, returns (host, nil)
 - Assign same host with different ID → returns (nil, nil) (race lost)
 - Assign to device that was manually cleared (external edit) → proceeds as normal assign
+- **ETag capture on read:**
+  - Setup: Mock GET returns device with ETag header
+  - Action: AssignHost step 1 reads device
+  - Expected: ETag value is captured and stored for use in step 3 PATCH
+- **If-Match sent on PATCH:**
+  - Setup: AssignHost has captured ETag from step 1
+  - Action: Step 3 sends PATCH
+  - Expected: PATCH request includes If-Match header with the captured ETag value
 
 **UnassignHost Idempotency:**
 - Unassign assigned host → osac_instance_id cleared; read-after-write confirms
 - Unassign same host again → idempotent, returns nil
 - Unassign host with different assignment ID → returns nil (not ours)
+- **412 during unassignment:**
+  - Setup: Mock GET returns device assigned to our instance; PATCH returns 412 Precondition Failed
+  - Action: UnassignHost step 2 sends PATCH with If-Match
+  - Expected: UnassignHost re-reads device (back to step 1) and retries; does NOT return error on first 412
 
 **Error Handling:**
 - NetBox API returns 401 → error logged; permanent; no retry
 - NetBox API returns 5xx → error logged; transient; retry
 - Network timeout → error logged; transient; retry
 - No secrets/credentials in any error message or log
+- **412 Precondition Failed:**
+  - Setup: Mock NetBox PATCH returns 412
+  - Action: AssignHost step 3
+  - Expected: Returns (nil, nil) — treated as race loss, NOT as a transient error (no automatic retry at HTTP level)
+- **412 distinguished from other 4xx:**
+  - Setup: Mock returns 400 Bad Request vs 412
+  - Expected: 400 → permanent error (fail fast); 412 → race loss path (return nil, nil)
 
-**Concurrent Access:**
-- Mock HTTP server; simulate race condition (two requests assign same host)
-- Both call FindFreeHost → same host returned
-- First calls AssignHost → succeeds
-- Second calls AssignHost → returns (nil, nil)
+**Concurrent Access (ETag-Based):**
+- **Setup:** Mock NetBox returns device with ETag: W/"2026-01-01T00:00:00.000000+00:00"
+- **Test 1 — First writer wins:**
+  - PATCH with If-Match: W/"2026-01-01T00:00:00..." → mock returns 200 OK with new ETag
+  - Expected: AssignHost returns (host, Ready)
+- **Test 2 — Second writer gets 412:**
+  - PATCH with If-Match: W/"2026-01-01T00:00:00..." → mock returns 412 Precondition Failed
+  - Expected: AssignHost returns (nil, nil); does NOT retry the same device; caller retries FindFreeHost
+- **Test 3 — Race sequence:**
+  - Two goroutines both call AssignHost on same device-42
+  - Both capture same ETag from GET
+  - First PATCH succeeds (200); second PATCH gets 412
+  - Assert: exactly one goroutine returns (host, Ready); exactly one returns (nil, nil)
+  - Assert: device-42 has osac_instance_id set to the winner's ID, not the loser's
+- **Concurrent tag-based FindFreeHost:**
+  - Setup: 3 devices with osac-cpu-cores-16 tag; 2 tenants request cpu_cores=16 simultaneously
+  - Action: Both call FindFreeHost with same tag filters
+  - Expected: Both get results from NetBox; AssignHost ETag protection prevents double-allocation; one gets device, other retries or gets different device
 
 ### Integration Tests
 
@@ -688,6 +776,10 @@ Decision impacts:
 - Verify FindFreeHost called; host allocated; ExternalHostID set in status
 - Delete BareMetalInstance; verify UnassignHost called; host deallocated
 - Verify no regressions in other backends (Metal3, BCM still work if configured)
+- **Concurrent assignment with ETag protection:**
+  - Setup: Two BareMetalInstance CRs requesting same label profile; only one device matches in mock NetBox
+  - Action: Both controllers attempt AssignHost on same device
+  - Expected: Exactly one gets 200; the other gets 412 and retries FindFreeHost; no device is double-assigned
 
 **Failure Recovery:**
 - Simulate NetBox connectivity loss (network partition) during FindFreeHost
@@ -699,9 +791,29 @@ Decision impacts:
 - Fix config (update Secret/ConfigMap); verify operator picks up change
 - Switch from one backend to another; verify no orphaned state
 
+**Tag Update on Device:**
+- Setup: Device has tag osac-memory-gb-64
+- Action: Admin removes osac-memory-gb-64 tag and adds osac-memory-gb-128
+- Expected: FindFreeHost for memory_gb=64 no longer returns this device; FindFreeHost for memory_gb=128 now returns it
+
+**Capacity Metrics Endpoint:**
+- Setup: Kind cluster with operator running; mock NetBox with 10 staged devices
+- Action: Scrape operator's /metrics endpoint
+- Expected: osac_netbox_hosts_available gauge shows 10; after one assignment, gauge shows 9
+
+**Server-Side Tag Filtering Verification:**
+- Setup: Kind cluster; mock NetBox with 10 devices: 5 have osac-gpu-model-a100, 5 have osac-gpu-model-v100
+- Action: Tenant requests gpu_model=A100
+- Expected: FindFreeHost query includes tag=osac-gpu-model-a100; NetBox returns only the 5 matching devices; operator does NOT receive or filter the V100 devices
+
+**Tag Mismatch — Zero Results:**
+- Setup: Mock NetBox devices have osac-gpu-model-a100
+- Action: Tenant requests gpu_model=H100
+- Expected: FindFreeHost query includes tag=osac-gpu-model-h100; NetBox returns empty list; operator requeues with "No hosts available"
+
 ### E2E Tests
 
-Tests run against **real NetBox container** (not mock). Fixtures provision NetBox instance with custom fields, pool tags, and test devices.
+Tests run against **real NetBox container** (not mock). Fixtures provision NetBox instance with osac_instance_id custom field, device selection tag (managed_by:osac), hardware label tags (osac-cpu-cores-16, osac-gpu-model-a100, etc.), and test devices.
 
 **End-to-End Provisioning:**
 - Create BareMetalInstance with label selector matching NetBox devices
@@ -709,6 +821,11 @@ Tests run against **real NetBox container** (not mock). Fixtures provision NetBo
 - Verify Metal3 BareMetalHost created for power management
 - Monitor provisioning completion (existing BareMetalInstance status workflow)
 - Delete instance; verify host deallocated and returned to pool
+- **Tag preservation after provisioning:**
+  - After provisioning succeeds, verify:
+    - Device in NetBox still has all original hardware label tags (osac-cpu-cores-16, etc.) — assignment does not remove them
+    - Device has osac_instance_id set (custom field, not tag)
+    - The managed_by:osac tag is still present
 
 **Tenant Transparency:**
 - Create instance against NetBox backend
@@ -718,9 +835,14 @@ Tests run against **real NetBox container** (not mock). Fixtures provision NetBo
 
 **Stress Test:**
 - Rapidly create 20 BareMetalInstance requests simultaneously
-- NetBox has only 10 available hosts matching labels
+- NetBox has only 10 available hosts matching label tags (server-side filtering)
 - Verify 10 succeed; 10 requeue and eventually fail ("No hosts available")
 - Verify no double-allocations in NetBox
+
+**Tag-Based Concurrent Stress:**
+- Setup: 50 devices with osac-cpu-cores-16; 20 tenants requesting cpu_cores=16 simultaneously
+- Action: All 20 reconcile loops fire concurrently
+- Expected: Exactly 20 devices assigned (one per tenant); 30 remain available; no double-allocations (verified by ETag 412 handling); no orphaned assignments
 
 ## Graduation Criteria
 
@@ -761,6 +883,7 @@ If future out-of-tree migration (OSAC-3806) separates backend into sidecar, vers
 **Symptoms of schema mismatch:**
 - Operator startup logs: "Custom field osac_instance_id not found in NetBox"
 - Operator exits or marks itself unhealthy
+- FindFreeHost returns zero devices when devices exist: verify hardware label tags (osac-<key>-<value>) are applied to devices in NetBox. Check tag slugs match expected format.
 
 ### Disable the Feature
 
@@ -787,7 +910,7 @@ To disable NetBox backend and switch to Metal3:
 
 To re-enable NetBox backend after disabling:
 
-1. Verify NetBox custom field exists and is properly configured
+1. Verify NetBox osac_instance_id custom field exists and is properly configured; verify hardware label tags are applied to devices
 2. Ensure API token Secret is present and valid
 3. Update Helm values back to `inventory.type: netbox`
 4. Helm upgrade; operator restarts
