@@ -73,9 +73,12 @@ The backend uses NetBox's native device model and REST API. Host allocation stat
 
 2. **Create Secret** (one-time setup):
    ```bash
+   # Use --from-file to avoid exposing token in shell history or process arguments
+   echo "<api-token>" > /tmp/netbox-token.txt
    kubectl create secret generic netbox-api-token \
-     --from-literal=token=<api-token> \
+     --from-file=token=/tmp/netbox-token.txt \
      -n osac
+   rm /tmp/netbox-token.txt
    ```
 
 3. **Configure Helm values** (`values.yaml`):
@@ -164,6 +167,18 @@ Crash recovery is handled by pre-recording `ExternalHostID` on the CR before Net
 - Cloud Infrastructure Admin sees actionable message in logs
 - Secret validation at operator startup should catch this before allocation attempts
 - Remediation: fix Secret; operator picks up changes on restart
+
+**Inventory Exhaustion (No Matching Hosts)**
+- `FindFreeHost` returns (nil, nil) when no devices match the tenant's label selectors or all matching devices are already assigned
+- Controller sets BareMetalInstance phase to `Failed` with condition `HostConditionAllocated = False`, reason `NoMatchingHosts`
+- Controller requeues reconciliation after `NoFreeHostsPollIntervalDuration` (configurable, default: 30 seconds)
+- Requeue attempts continue indefinitely until:
+  - **Capacity becomes available:** Cloud Infrastructure Admin adds devices with matching labels to NetBox and tags them with `managed_by:osac` → next reconciliation retry succeeds
+  - **Existing hosts deallocated:** Other BareMetalInstance objects deleted → freed devices become available → next reconciliation retry succeeds
+  - **Request cancelled:** Tenant deletes the BareMetalInstance
+- Tenant sees condition: `HostConditionAllocated = False`, `reason = "NoMatchingHosts"`, `message = "No matching hosts available"`
+- Tenant sees event emitted to BareMetalInstance object
+- Remediation: Cloud Infrastructure Admin adds matching capacity to NetBox inventory (no operator restart needed)
 
 ### API Extensions
 
@@ -353,10 +368,10 @@ Hardware labels are stored as NetBox tags in osac-<key>-<value> format. Label ma
    - If `osac_instance_id` is empty → return success (already unassigned)
    - If has **different assignment** → return success (not ours; don't touch)
    - If has **matching assignment** → proceed to step 2
-2. Clear assignment: PATCH NetBox to clear `osac_instance_id`. **Include `If-Match: <etag>` header from step 1.** If NetBox returns **412 Precondition Failed** → re-read device and retry from step 1 (another process modified the device concurrently).
-3. Verify write (sanity check): read device back; confirm field is cleared
-4. Delete BMH: call `bmhManager.DeleteBMH()` to remove Metal3 BareMetalHost CR
-5. Delete Secret: call `bmhManager.DeleteBMCSecret()` to remove BMC credentials
+2. Delete BMH: call `bmhManager.DeleteBMH()` to remove Metal3 BareMetalHost CR (device remains assigned in NetBox during cleanup)
+3. Delete Secret: call `bmhManager.DeleteBMCSecret()` to remove BMC credentials
+4. Clear assignment: PATCH NetBox to clear `osac_instance_id`. **Include `If-Match: <etag>` header from step 1.** If NetBox returns **412 Precondition Failed** → re-read device and retry from step 1 (another process modified the device concurrently).
+5. Verify write (sanity check): read device back; confirm field is cleared
 
 **Idempotency Contract:**
 - Same read-first pattern as AssignHost
@@ -427,14 +442,22 @@ management:
 **Validation at deployment:**
 - Operator startup checks `inventory.type == "netbox"` AND `management.type == "metal3"`
 - Fails fast if either is missing or misconfigured
+- On NetBox configuration: attempts immediate connectivity and schema validation; fails operator startup if NetBox is unreachable or schema is invalid
 
-Enclave Wizard pipeline:
+Enclave Wizard pipeline (pre-deployment):
 1. Accepts user input (NetBox endpoint, credentials, Metal3 namespace)
 2. Creates Kubernetes Secret with NetBox API token
-3. Validates NetBox connectivity and schema: confirms osac_instance_id custom field exists; verifies managed_by:osac device selection tag is defined
+3. Validates NetBox connectivity and schema: confirms osac_instance_id custom field exists; verifies managed_by:osac device selection tag is defined; attempts authentication with provided token
 4. Validates Metal3 availability (BareMetalHost CRD installed)
 5. Generates values.yaml with resolved configuration
 6. Helm chart deploys operator with both inventory and management backends configured
+
+**Startup validation contract (operator initialization):**
+- Authentication failures (401, 403): detected at operator startup via schema validation call; operator fails fast with actionable message
+- Connectivity failures: detected at operator startup; operator fails fast
+- Schema validation failures (osac_instance_id missing): detected at operator startup; operator fails fast
+- Invalid endpoint URL: detected at operator startup; operator fails fast
+- Result: if operator starts successfully, NetBox backend is reachable, authenticated, and properly configured
 
 ### Error Messages and Diagnostics
 
