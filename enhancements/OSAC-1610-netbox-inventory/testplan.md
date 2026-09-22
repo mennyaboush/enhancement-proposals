@@ -318,7 +318,7 @@ client. No external dependencies.
 **Test: Successful Assignment**
 - **Setup:** Device found unassigned; AssignHost called with instanceID "inst-123"
 - **Action:** AssignHost(inventoryHostID="baremetal/netbox-device-1", bareMetalInstanceID="inst-123")
-- **Expected:** Device PATCH sets status=active and osac_instance_id to "inst-123"; read-after-write confirms both; returns (host, nil)
+- **Expected:** Device PATCH sets status=active and osac_instance_id to "inst-123"; returns (host, nil)
 
 **Test: Idempotent Retry — Same Assignment ID**
 - **Setup:** Device already has status=active and osac_instance_id = "inst-123"
@@ -352,7 +352,7 @@ client. No external dependencies.
 **Test: Successful Deassignment**
 - **Setup:** Device has status=active and osac_instance_id = "inst-123"
 - **Action:** UnassignHost(inventoryHostID="baremetal/netbox-device-1")
-- **Expected:** Device PATCH sets status=staged and clears osac_instance_id; read-after-write confirms both; returns nil
+- **Expected:** Device PATCH sets status=staged and clears osac_instance_id; returns nil
 
 **Test: Idempotent Retry — Already Unassigned**
 - **Setup:** Device already has status=staged and osac_instance_id = nil (unassigned)
@@ -366,7 +366,7 @@ client. No external dependencies.
 
 **Test: 412 During Unassignment — Retry from Read**
 - **Setup:** Mock GET returns device assigned to our instance; PATCH returns 412 Precondition Failed
-- **Action:** UnassignHost step 2 sends PATCH with If-Match
+- **Action:** UnassignHost step 4 sends PATCH with If-Match
 - **Expected:** UnassignHost re-reads device (back to step 1) and retries; does NOT return error on first 412
 
 ---
