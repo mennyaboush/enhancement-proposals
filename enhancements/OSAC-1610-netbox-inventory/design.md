@@ -15,7 +15,7 @@ superseded-by: []
 
 ## Summary
 
-This design adds NetBox as a pluggable inventory backend for bare-metal host allocation in OSAC, following the existing backend pattern. Cloud Infrastructure Admin configures the NetBox endpoint and certificate material through Helm values; the chart renders the API-token and CA Secrets referenced by the operator's inventory configuration. OSAC allocates hosts transparently from NetBox inventory without exposing backend details to tenants. See [PRD](prd.md) for detailed requirements.
+This design adds NetBox as a pluggable inventory backend for bare-metal host allocation in OSAC, following the existing backend pattern. Cloud Infrastructure Admin configures the NetBox endpoint and credential material through Helm values; the chart mounts the token and optional CA as files and configures Metal3 management automatically. OSAC allocates hosts transparently from NetBox inventory without exposing backend details to tenants. See [PRD](prd.md) for detailed requirements.
 
 ## Motivation
 
@@ -31,16 +31,17 @@ Deployment is in-tree (compiled into the operator) following established pattern
 
 - Prevent double-allocation of hosts via atomic assignment in NetBox with ETag-based optimistic locking (If-Match on PATCH; 412 Precondition Failed on conflict).
 - Track allocation state in NetBox's native device status (`staged` available, `active` claimed), with `osac_instance_id` identifying the claiming BareMetalInstance for crash recovery and idempotency.
-- Support `BareMetalInstanceType` host selection via pre-created NetBox tags (server-side filtering with AND semantics across tags); selector keys are exact NetBox tag slugs and the generic selector values are ignored by this backend.
+- Support `BareMetalInstanceType` host selection through pre-created NetBox custom fields, preserving selector keys and values and combining their equality filters server-side.
 - Expose Helm configuration for the NetBox endpoint, credentials, and TLS certificates; an existing Enclave Wizard pipeline may schema-validate these values without exposing secrets in logs or error messages.
 - Maintain tenant transparency — allocation/deallocation workflows identical across all backends; no NetBox-specific UX.
 
 ### Assumptions
 
-- NetBox is an operator-managed external dependency. OSAC does not create or manage NetBox devices, tags, custom fields, or its infrastructure.
+- NetBox Community is an operator-managed external dependency. The integration uses its open-source REST API, custom fields, and conditional updates; no Enterprise feature, paid plugin, or direct database access is required. OSAC does not create devices or field definitions.
 - The NetBox deployment permits OSAC to persist allocation state in the native device `status` and the `osac_instance_id` custom field. These are integration prerequisites, not fields created by OSAC at runtime.
-- The `BareMetalInstanceType.host_label_selector` is the placement-label source. For NetBox, each selector key is an existing NetBox tag slug; NetBox tags are names rather than key/value pairs, so the adapter uses the keys and ignores the non-empty generic selector values. The adapter does not derive placement tags from CPU, memory, or accelerator fields and does not fetch the instance type at allocation time.
+- The existing OSAC API field `BareMetalInstanceType.host_label_selector` supplies the host-selection criteria. For NetBox, each key names a provider-created custom field on `dcim.device`, and each value specifies the required scalar value. The API field name remains unchanged; it does not mean that NetBox tags or Kubernetes labels are used for matching. The adapter adds only the REST query prefix `cf_`; it does not derive selectors from the instance type's hardware description or fetch the instance type during allocation.
 - The API token is granted only the read/update permissions required for the documented device and custom-field operations.
+- Enrolled device names meet the [host identity contract](#host-id-mapping): valid unchanged BMH names, unique in the operator-visible inventory, and aligned with the deployment's fabric hostnames. Administrators coordinate renaming, device replacement, and endpoint changes by draining affected instances first.
 
 ### Non-Goals
 
@@ -52,14 +53,22 @@ Deployment is in-tree (compiled into the operator) following established pattern
 
 ## Proposal
 
-NetBox backend is implemented in `bare-metal-fulfillment-operator/internal/inventory/netbox.go`, following the existing backend pattern. A new `NetBoxClient` struct implements the `Client` interface with the following methods. Because the client reuses the existing `baremetalhost.Manager` BMH lifecycle manager, operator startup wires it through the same dependency-injection/factory path used by the existing BCM backend; this does not change the `inventory.Client` interface or the controller's reconciliation state machine. A small shared logging hardening change is required at the existing controller boundary so raw selectors, host IDs, and instance IDs are not emitted by the generic allocation logs.
+NetBox backend is implemented in `bare-metal-fulfillment-operator/internal/inventory/netbox.go`, following the existing backend pattern. A new `NetBoxClient` reuses `baremetalhost.Manager` through the startup factory used by BCM. The internal inventory contract gains explicit per-instance context for safe claim and release; the controller preserves its normal lifecycle order and adds persisted recovery/cleanup checkpoints for NetBox. Shared allocation logs are also hardened so raw selectors, host IDs, and instance IDs are not emitted.
 
-- **`FindFreeHost(ctx, matchExpressions)`** — Query NetBox for unassigned pool devices filtered by the NetBox tag slugs in the selector keys (server-side); return the first matching candidate as the deterministic `<metal3 namespace>/netbox-device-<id>` host ID or nil.
-- **`AssignHost(ctx, inventoryHostID, bareMetalInstanceID, labels)`** — Resolve the NetBox device ID from the host ID, atomically mark it assigned using ETag-based optimistic locking, and ensure the Metal3 resources; idempotent for crash recovery.
-- **`UnassignHost(ctx, inventoryHostID, labels)`** — Resolve the NetBox device ID, clear assignment state, and remove the operator-managed Metal3 resources; idempotent.
+- **`FindFreeHost(ctx, matchExpressions)`** — Validate the selector against NetBox's field metadata, query unassigned pool devices using custom-field equality filters, and validate candidate data and naming; return `<metal3 namespace>/<device.name>` plus the separate numeric NetBox device ID, or nil when no device matches.
+- **`AssignHost(ctx, inventoryHostID, instance, labels)`** — Revalidate the saved selector and pool eligibility, atomically claim with an ETag, and ensure the Metal3 resources; idempotent for crash recovery.
+- **`UnassignHost(ctx, inventoryHostID, instance, labels)`** — Verify the requesting instance owns the claim, complete its Metal3 cleanup, then clear allocation state; idempotent.
 - **`GetHostNICs(ctx, inventoryHostID)`** — Parse the deterministic BMH host ID and delegate to the existing `baremetalhost.Manager.GetHardwareNICs`; convert the returned MAC addresses to `inventory.HostNIC` values. Return `(nil, nil)` only when the BMH has not reported hardware NIC data yet. [Codebase: `osac/bare-metal-fulfillment-operator/internal/inventory/bcm.go`]
 
-The implementation affects three existing areas: the BMF operator's NetBox client and startup wiring (`internal/inventory/` and `cmd/main.go`), the BMF and umbrella Helm charts (values, Secrets, mounts, and backend configuration), and the monorepo E2E suite under `osac/tests/e2e/bmaas/` for the real NetBox/Metal3 scenarios. It adds no CRD, gRPC, or tenant-facing API changes.
+The implementation affects the BMF inventory clients/interface and mocks,
+BMI/pool controller call sites, startup factory, and internal BMH manager; the BMF and
+umbrella Helm charts; and the monorepo E2E suite under
+`osac/tests/e2e/bmaas/`. Existing backends receive mechanical signature
+updates and retain their current behavior. Fulfillment-service selector
+projection gets regression coverage, without a new API or projection rule.
+No CRD schema, gRPC, or tenant-facing API changes are added. The controller
+also persists the existing `ExternalHostName` and a private device-ID annotation
+before claiming a NetBox candidate; existing backends retain their behavior.
 
 Configuration flows through the existing BMF inventory configuration Secret and the backend-specific Secrets rendered by Helm. Cloud Infrastructure Admin provides:
 
@@ -75,18 +84,19 @@ The backend uses NetBox's native device model and REST API. Host allocation stat
 #### Cloud Infrastructure Admin: Configure NetBox Backend
 
 1. **Prerequisite:** Devices exist in NetBox with:
-   - Capability tags are pre-created in NetBox and applied to devices (for example, `osac-cpu-cores-16`, `osac-gpu-model-a100`, and `osac-memory-gb-128`). The corresponding `BareMetalInstanceType.host_label_selector` keys must use those exact tag slugs. OSAC does not create, update, or remove capability tags.
-   - The following exact OSAC-owned custom fields on `dcim.device` (these are not built-in NetBox fields and must be created as part of NetBox preparation):
-     - `osac_bmc_username` — text, required; BMC login username.
-     - `osac_bmc_password` — text, required; BMC login password. Access is controlled by NetBox RBAC; NetBox custom fields are not a Kubernetes Secret.
-     - `osac_bmc_address` — text, required; complete Metal3-compatible BMC address, including protocol and Redfish system path when applicable.
-     - `osac_boot_mac` — text, required; the boot NIC MAC address in canonical colon-separated form.
+   - A nonempty, unique name accepted unchanged by the BMH naming contract below; for example `worker-rack3-07`. When the fabric uses hostname lookup, its server entry uses this same name.
+   - Capability custom fields are pre-created on `dcim.device` with exact filtering and populated by the administrator, for example integer `cpu_cores=16`, text `gpu_model="a100"`, and integer `memory_gb=128`. The instance type selector uses those exact names and string values (`cpu_cores: "16"`). These names are examples, not a hardcoded hardware schema. OSAC does not write capability data.
+   - The following exact integration custom fields on `dcim.device` (administrator-created, not built-in NetBox fields). BMC values are required on hosts assigned by OSAC; their definitions may use `required=false` so unrelated devices are unaffected:
+     - `osac_bmc_username` — text; BMC login username.
+     - `osac_bmc_password` — text; BMC login password. Access is controlled by NetBox RBAC; NetBox custom fields are not a Kubernetes Secret.
+     - `osac_bmc_address` — text; complete Metal3-compatible BMC address, including protocol and Redfish system path when applicable.
+     - `osac_boot_mac` — text; the boot NIC MAC address in canonical colon-separated form.
      - `osac_instance_id` — text, optional/nullable, with NetBox custom-field
        filtering set to `exact`; OSAC allocation owner, written and cleared by
        the backend. The exact filter setting enables the server-side
        `cf_osac_instance_id__empty=true` narrowing query.
-     OSAC does not use an `osac_labels` custom field; capability selectors are represented by NetBox tags.
-   - Tag named `managed_by:osac` applied (NetBox slug `managed-by-osac`; identifies devices available for OSAC allocation)
+     - `osac_managed` — boolean, optional, default `false`, exact filtering; the administrator explicitly sets it to `true` on devices in the OSAC pool. Missing, null, or false values exclude a device. This field records pool membership, not the allocation owner.
+     Capabilities use separate scalar custom fields; no generic JSON `osac_labels` field or NetBox tag convention is required.
    - Status set to `staged` (available for allocation). The backend changes it to `active` when it claims the device and restores `staged` on release.
 
 2. **Configure the canonical Helm values** under `bmf.netbox`, `bmf.metal3`,
@@ -108,48 +118,119 @@ The backend uses NetBox's native device model and REST API. Host allocation stat
    BMF startup factory and given the Metal3 `baremetalhost.Manager`. The operator
    performs the runtime connectivity, authentication, and required-custom-field
    checks described in the startup validation contract; Helm and Enclave Wizard
-   do not probe NetBox or Metal3.
+   do not probe NetBox. The optional existing installer hook checks Metal3
+   prerequisites inside the cluster; Wizard validation and offline rendering
+   do not perform that check.
 
 #### Existing BareMetalInstance reconciliation
 
-The existing `BareMetalInstanceReconciler` remains the caller of the inventory client; this design does not change its top-level reconciliation flow. The NetBox adapter participates at the existing interface boundaries:
+The existing `BareMetalInstanceReconciler` remains the caller of the inventory client. The NetBox adapter uses its existing discovery/assignment/deallocation boundaries, with the additional identity persistence and cleanup routing described below:
 
-1. The fulfillment-service resolves the referenced `BareMetalInstanceType` `host_label_selector` (or the existing legacy template fallback when no instance type is referenced) into the CRD's immutable `spec.selector.hostSelector`. The reconciler clones that map and passes it unchanged to `FindFreeHost`; the tenant request does not supply a separate arbitrary label map. For new NetBox profiles, the instance type selector keys are the exact pre-created NetBox tag slugs. The adapter ignores the generic map value, then adds the fixed pool tag and `staged` tag/status filters. It checks `osac_instance_id` in each returned device to exclude assigned devices.
+1. The fulfillment-service resolves the referenced `BareMetalInstanceType` `host_label_selector` (or the existing legacy template fallback when no instance type is referenced) into the CRD's immutable `spec.selector.hostSelector`. The reconciler clones that map and passes it unchanged to `FindFreeHost`; the tenant request does not supply a separate arbitrary capability map. The adapter validates custom-field names, types, and filtering, then sends each key/value pair as `cf_<key>=<value>` alongside the fixed pool, status, and empty-owner filters. Returned devices are checked for pool membership, availability, and the requested capability values.
    The adapter does not fetch the instance type or add a separate NetBox
    `device_type` filter, and it does not extract selectors from the instance
    type's hardware fields. Any hardware distinction needed for placement must
-   be represented by a tag key in the resolved HostSelector.
-2. `FindFreeHost` returns an inventory host ID in the existing `<namespace>/<name>` form expected by the controller and Metal3 management client: `<metal3 namespace>/netbox-device-<NetBox device ID>`. The reconciler persists that ID in `ExternalHostID` before calling `AssignHost`, as it does for the other inventory backends. This persisted ID is the recovery pointer: when it is already set, the controller skips `FindFreeHost` and lets `AssignHost` reconcile the NetBox state.
-3. `AssignHost` performs the NetBox ownership claim and delegates BMC/BareMetalHost setup to the existing Metal3 lifecycle integration. The reconciler then continues through the existing provisioning and readiness conditions.
-4. During deallocation, the reconciler calls `UnassignHost`; the adapter clears the NetBox ownership field and delegates physical cleanup to the existing Metal3 lifecycle integration.
+   be represented by a custom-field key/value pair in the resolved HostSelector.
+2. `FindFreeHost` returns `<metal3 namespace>/<device.name>`, `Host.Name=device.name`, and a separate `Host.BackendID` containing the numeric NetBox ID. Before calling `AssignHost`, the reconciler persists `ExternalHostID`, `ExternalHostName`, and the private device-ID annotation together in one BMI update. When this binding exists, reconciliation skips `FindFreeHost` and passes the saved device ID to `AssignHost`; no BMH or in-memory cache is needed to recover after a restart.
+3. `AssignHost` receives the instance's persisted selector and identity, rechecks eligibility on a fresh NetBox detail read, then claims ownership and delegates BMC/BareMetalHost setup to the Metal3 lifecycle integration. The reconciler continues through the existing provisioning and readiness conditions.
+4. During deallocation, the reconciler calls `UnassignHost`; the adapter completes owner-checked Metal3 resource cleanup before clearing the NetBox ownership field.
+
+The existing deletion path can initiate network-offboard power operations
+before `UnassignHost`. Gate that shutdown on a nonempty assigned `HostClass`
+and the presence of `BareMetalInstanceNetworkingFinalizer`, in addition to
+the existing networking configuration checks. That finalizer is recorded
+before network work starts and is retained for cleanup. A saved candidate ID
+or the discovery-time `Allocated` condition alone is not ownership evidence.
+Deletion before successful assignment therefore performs no power operation
+or networking teardown on the candidate; inventory cleanup still verifies
+the requesting UID. Existing finalizer-driven network/management cleanup for
+successfully assigned instances remains in its current order.
 
 The detailed retry, race, and crash-recovery behavior belongs with the individual client methods below and the existing controller retry policy. Tenant-facing BareMetalInstance APIs and provisioning state transitions remain unchanged.
 
-#### Selector data flow and lifetime
+#### Selector inputs and compatibility constraints
 
-`hostSelector` is a persistent field in the BareMetalInstance **spec**, not a
-temporary argument created by the NetBox adapter. Before the CR is created,
-fulfillment-service copies the referenced instance type's
-`host_label_selector.match_labels` into `spec.selector.hostSelector`. The CRD
-requires at least one entry and makes the selector immutable, so the map stays
-with that BareMetalInstance for its lifetime, including allocation, provisioning,
-deallocation, and controller restarts. The controller uses it for
-`FindFreeHost` while no `ExternalHostID` is recorded; after a candidate ID is
-persisted, retries use that ID with `AssignHost` and do not select by tags again.
-The NetBox client does not fetch or reconstruct the instance type at allocation
-time.
+Existing context: fulfillment-service projects the instance type's
+`host_label_selector.match_labels` into the immutable BMI
+`spec.selector.hostSelector`. This proposal adds no new selector API.
+
+The NetBox-specific change is passing that saved map to `AssignHost` through
+`AllocationContext` so a persisted candidate can be revalidated after restart.
+The existing assignment `labels` parameter comes from BMI inventory metadata
+(`spec.inventoryLabels`, `spec.inventoryPersistentLabels`, and the pool ID),
+not from `hostSelector`. It is separate from capability selection: NetBox
+does not interpret that parameter as capabilities or write it to custom fields.
+The release `labels` list likewise is not a custom-field deletion request.
+The adapter does not fetch or reconstruct
+the instance type. Fulfillment-service currently re-resolves the catalog during
+reconciliation even for existing CRs. Because that can conflict with CRD
+immutability, administrators must create a new instance type instead of
+changing selectors on types still referenced by live or pending instances.
+Retain that old catalog identity unchanged; do not delete/recreate it. The
+same restriction applies to the legacy template selector source. Pool-created
+BMIs use their persisted profile selector, including the existing
+`managedBy=baremetal` default when present. NetBox adds no Metal3-style aliases:
+`hostType` or `managedBy` must be compatible exact custom-field names with
+populated values, or the administrator must configure another selector.
+This feature does not rely on catalog edits safely changing only new requests.
+
+For pool-created BMIs, extend the pool controller to propagate the trusted
+parent `BareMetalPool` tenant annotation to its child BMI. A NetBox-backed
+pool must be associated with its actual tenant before allocation; absence of
+trusted tenant metadata is a configuration error, never an invented tenant
+or permission to create unscoped resources. Existing non-NetBox backends keep
+their current behavior. This metadata propagation is explicit new work; the
+current pool controller does not populate it.
 
 ### API Extensions
 
-No new CRDs or gRPC services. NetBox integration is entirely within the `inventory.Client` abstraction. Existing APIs remain unchanged:
+No new CRDs or gRPC services. Tenant-facing APIs remain unchanged:
 
 - **BareMetalInstance API** — no modifications. Tenants request hosts via standard API; backend transparent.
-- **inventory.Client interface** — no modifications; NetBox implements existing contract.
+- **inventory.Client interface** — internal Go-only extension described below;
+  all implementations and test doubles are updated in the same operator build.
+- **Operator-managed BMI metadata** — the existing host ID/name fields and
+  `osac.openshift.io/inventory-device-id` annotation form the NetBox recovery
+  binding; `osac.openshift.io/inventory-cleanup` records cleanup progress.
+  They are not tenant inputs or capability selectors.
+
+The controller constructs a backend-neutral `AllocationContext` from the
+persisted BMI for both assignment and release:
+
+```go
+type AllocationContext struct {
+    InstanceID          string // Kubernetes BMI UID, never the API UUID
+    InstanceName        string
+    InstanceNamespace   string
+    BackendID           string // persisted backend device ID; NetBox numeric ID
+    CleanupState        string // controller-owned cleanup checkpoint, if any
+    HostSelector        map[string]string // copy of spec.selector.hostSelector
+    ResourceAnnotations map[string]string // trusted tenant and owner-reference only
+}
+```
+
+`AssignHost` replaces its existing instance-ID string parameter with this
+context; `UnassignHost` adds the context before its existing `labels []string`.
+Assignment `labels map[string]string` retains its existing meaning. BCM,
+Metal3, and OpenStack read `InstanceID` where applicable and otherwise keep
+their current matching and label behavior. NetBox uses the saved selector
+for new claims and the UID for both claims and release. No in-memory
+selection cache or lookup of a mutable catalog entry is required. `Host`
+gains the same optional `BackendID string` field; NetBox returns its device
+ID, and existing backends leave it empty. Only the NetBox path requires and
+persists it, as specified below.
+
+NetBox additionally uses the controller-owned annotation
+`osac.openshift.io/inventory-cleanup` for restart-safe cleanup. Its state is
+copied into `AllocationContext.CleanupState`, never taken from assignment
+labels. The controller and adapter use typed preparation-failure and
+cleanup-checkpoint results as described under release; existing backends
+do not emit them and keep their behavior.
 
 Operational impact if controller is down:
 - New BareMetalInstance requests pend until controller restarts
 - Running hosts remain allocated (assignment recorded in NetBox)
-- On controller restart: reconciliation resumes; no re-allocation occurs (`ExternalHostID` is checked before `FindFreeHost`; if already set, allocation resumes from `AssignHost`)
+- On controller restart: persisted cleanup resumes from `UnassignHost`; otherwise an existing complete host binding resumes `AssignHost` before any new `FindFreeHost` call
 
 ## UX Alignment
 
@@ -164,8 +245,8 @@ NetBox backend configuration follows the existing `inventory.Config` pattern:
 ```go
 type NetBoxOptions struct {
     Endpoint     string `json:"endpoint"`     // https://netbox.example.com
-    TokenSecret  string `json:"tokenSecret"`  // Kubernetes Secret name/key token
-    CACertSecret string `json:"caCertSecret"` // Optional Secret/key ca.crt
+    TokenFile    string `json:"tokenFile"`    // required mounted token file
+    CACertFile   string `json:"caCertFile"`   // optional mounted PEM CA file
 }
 ```
 
@@ -174,35 +255,45 @@ The operator unmarshals the generic `inventory.Config` from the YAML in the Secr
 ```yaml
 name: netbox-inventory
 type: netbox
-hostClass: netbox
+hostClass: metal3
 options:
   netbox:
     endpoint: "https://netbox.example.com"
-    tokenSecret: "osac-netbox-api-token"
-    caCertSecret: "osac-netbox-ca" # optional
+    tokenFile: "/etc/osac/secrets/osac-netbox-api-token/token"
+    caCertFile: "/etc/osac/secrets/osac-netbox-ca/ca.crt" # optional
 ```
 
-Helm renders this `inventory.yaml` and the referenced Secrets; `tokenSecret`
-and `caCertSecret` are names of the Secrets rendered by this chart, not names
-of runtime Secrets that the operator creates during allocation. Enclave Wizard
-only validates and passes the configuration values through. [Locked: D2]
+Helm renders this `inventory.yaml`, credential Secrets, read-only mounts,
+and Metal3 management configuration. Secret names are chart inputs under
+`bmf.secrets`; only the resulting file paths reach `NetBoxOptions`. The
+operator loads those files at startup and does not fetch API-token/CA Secrets
+through the Kubernetes API. Enclave Wizard only validates and passes the
+configuration values through. [Locked: D2]
 
-**Hardcoded Conventions:** The allocation tag and allocation-state fields are fixed. Capability tags are administrator-managed and are not mutated by OSAC:
-- Device selection tag: name `managed_by:osac`, slug `managed-by-osac` (identifies OSAC-managed devices)
+Inventory `type: netbox` chooses the discovery/claim client; `hostClass: metal3`
+chooses the existing AAP provisioning workflow. The startup factory requires
+management `type: metal3`, a nonempty management namespace, and inventory
+`hostClass: metal3`; it constructs the BMH manager with that namespace.
+There is no new `netbox` provisioning class or AAP role.
+[Codebase: `osac/osac-aap/collections/ansible_collections/osac/templates/roles/bm_host_provisioning/vars/main.yaml`]
+
+**Hardcoded Conventions:** Pool membership and allocation-state fields are fixed. Capability fields are administrator-managed and are not mutated by OSAC:
+
+- Device pool: custom field `osac_managed=true`
 - Allocation state: device status `staged` (available) or `active` (claimed)
 - Allocation owner: `osac_instance_id` custom field (empty when unassigned)
-- Capability tags: pre-created NetBox tag slugs such as `osac-cpu-cores-16` and `osac-gpu-model-a100`; the matching `BareMetalInstanceType.host_label_selector` keys are sent unchanged as `tag=` filters.
+- Capabilities: separate custom fields such as `cpu_cores` and `gpu_model`; the matching selector is sent as `cf_cpu_cores=16&cf_gpu_model=a100`. No mapping table, slug encoding, or per-capability code change is needed when field names match selector keys.
 
 ### Allocation Tracking and Device Filtering
 
-Allocation state, ownership, and device pool selection use three NetBox mechanisms:
+The native device status and separate custom fields identify availability, ownership, and pool membership:
 
-**1. Device Pool Selection via NetBox Tags**
+**1. Device Pool Selection via Custom Field**
 
-Devices are tagged in NetBox with the OSAC pool tag named `managed_by:osac`
-(slug `managed-by-osac`). Cloud Infrastructure Admin applies this tag to all
-devices that should be available for OSAC allocation; the operator queries
-only the slug.
+Cloud Infrastructure Admin sets the boolean `osac_managed` field to `true`
+on devices available to OSAC. The query requires `cf_osac_managed=true`;
+the adapter also requires a JSON boolean `true` in returned device data.
+Allocation and release preserve this administrator-owned field.
 
 **2. Allocation State via Device Status**
 
@@ -214,77 +305,147 @@ A custom field `osac_instance_id` (string, nullable) on each device stores the B
 
 ### Host ID Mapping
 
-The generic controller persists `Host.InventoryHostID` and passes it to both the inventory and management clients. Therefore the NetBox adapter does not expose a bare numeric NetBox ID as `ExternalHostID`. `FindFreeHost` derives the DNS-safe BMH name `netbox-device-<id>` from the numeric NetBox device ID and returns `<metal3 namespace>/netbox-device-<id>`. `AssignHost` and `UnassignHost` parse and validate that form, derive the same NetBox device ID for REST calls, and use the same BMH name for lifecycle operations. The existing manager derives the operator-managed BMC Secret name as `<bmh-name>-bmc-secret`. This keeps the existing Metal3 management client able to power and inspect the BMH created during assignment.
+Use the NetBox device's existing `name` unchanged as the BareMetalHost name,
+following BCM. For device ID `42`, name `worker-rack3-07`, and namespace
+`baremetal`, the binding is:
+
+| Purpose | Value |
+|---|---|
+| `Host.InventoryHostID` / BMI `spec.externalHostID` | `baremetal/worker-rack3-07` |
+| `Host.Name` / BMI `spec.externalHostName` | `worker-rack3-07` |
+| BMH `metadata.name` | `worker-rack3-07` |
+| Operator-managed BMC Secret name | `worker-rack3-07-bmc-secret` |
+| `Host.BackendID` / BMI `osac.openshift.io/inventory-device-id` annotation | `42` |
+| NetBox detail/claim/release endpoint | `/api/dcim/devices/42/` |
+
+The namespace qualifies the Kubernetes object; it is not added to the NetBox
+device name. Metal3 uses namespace/name, while NetBox REST operations use the
+separately saved numeric ID. [User direction; Codebase:
+`osac/bare-metal-fulfillment-operator/internal/inventory/bcm.go`]
+
+**Name validation:** Require 1–63 lowercase ASCII letters, digits, or hyphens,
+starting and ending with a letter or digit, matching BCM's conservative
+hostname contract. Reject invalid or empty names rather than lowercasing,
+truncating, adding a prefix, or replacing characters. This integration rule
+is narrower than Kubernetes' general DNS-subdomain naming rules. NetBox itself
+allows unnamed devices and uniqueness scoped by site/tenant, so it does not
+guarantee this contract. Require unique names across the inventory visible to
+the OSAC token, which must include all devices enrolled in this deployment.
+[Community device naming](https://github.com/netbox-community/netbox/blob/v4.6.10/docs/models/dcim/device.md#name)
+
+For each otherwise eligible candidate, query `/api/dcim/devices/?name=<name>`
+with URL encoding and no availability/capability filter; inspect every page.
+NetBox's `name` filter uses case-insensitive equality, so count case-equivalent
+names as collisions, then require the sole result's exact unchanged name and
+ID to equal the candidate. An invalid/ambiguous name is a configuration error,
+not no capacity. Repeat this check before a new claim, then re-read the bound
+device for name, eligibility, and ETag. Existing BMH/Secret name collisions
+are subject to the UID ownership guards; foreign resources are never adopted.
+This name check is read-only and does not replace custom-field host selection.
+Administrators must not introduce duplicate names or rename devices while
+allocation is in progress; a device ETag cannot lock another device's name.
+[Community name filter](https://github.com/netbox-community/netbox/blob/v4.6.10/netbox/dcim/filtersets.py#L1319-L1321)
+
+**Durable binding:** Persist the host ID, name, and numeric ID annotation in
+one successful BMI API update before any NetBox claim or per-host resource
+write. Validate the numeric ID as a positive canonical decimal int64. The
+controller copies this operator-managed value into `AllocationContext.BackendID`,
+separate from tenant/owner annotations and assignment labels. Fulfillment
+reconciliation must preserve these operator-managed fields and annotation.
+On confirmed race loss/reselection, clear all three together. Errors, uncertain
+writes, and cleanup retries retain them. A partial/malformed binding fails
+closed; never reconstruct the numeric ID from a name or a BMH that might not
+yet exist. The configured endpoint/namespace must remain unchanged until all
+pending and allocated instances are drained.
+
+**Rename/replacement recovery:** Keep names unchanged from candidate selection
+through release. If a detail read finds a renamed device, `AssignHost` returns
+a configuration error, retains the binding/claim, and creates no replacement
+BMH. Owner-checked release still addresses the original numeric ID and saved
+BMH name, even after a rename or pool removal. If the numeric ID returns 404,
+retain the binding/finalizer for administrator repair; never look up or touch
+a replacement device that reuses the old name. This is recovery at lifecycle
+boundaries, not proactive health monitoring.
+
+**Networking and provisioning:** Persist `ExternalHostName` at selection, not
+only after readiness. Existing network attachment/offboard jobs use it, and
+their `ExternalHostID` suffix fallback produces the same unchanged name.
+The provider must register that name in any hostname-based fabric inventory;
+OSAC does not translate it. DHCP continues to prefer the inspected NIC MAC and
+uses the same name only when its existing MAC-less fallback applies. An
+already-allocated host is not renamed automatically. AAP routes `HostClass=metal3`
+to its existing Metal3 provisioning role, which finds the BMH using
+`ExternalHostID`. Test these existing consumers end to end; no new networking
+backend or NetBox provisioning role is introduced.
+[Codebase: `osac/osac-aap/playbook_osac_move_network_attachment.yml`,
+`osac/osac-aap/playbook_osac_query_dhcp_lease.yml`]
 
 **FindFreeHost Query:**
 
 The query combines server-side device-pool filters with the resolved
-`spec.selector.hostSelector` capability tags:
+`spec.selector.hostSelector` capability values:
 
 ```
-GET /api/dcim/devices/?tag=managed-by-osac&tag=osac-cpu-cores-16&tag=osac-gpu-model-a100
+GET /api/dcim/devices/?cf_osac_managed=true&cf_cpu_cores=16&cf_gpu_model=a100
 &status=staged&cf_osac_instance_id__empty=true&limit=100&offset=0
 ```
 
-Pool and capability filters are applied server-side. The owner field is
-checked after decoding each returned device:
+Distinct query parameters are combined with AND semantics. The adapter
+verifies returned device data before accepting a candidate:
 
 | Filter/check                    | Purpose                                      |
 |---------------------------------|----------------------------------------------|
-| tag=managed-by-osac             | Device membership                            |
-| tag=<hostSelector key> (×N)     | Capability-tag matching (AND)                |
+| `cf_osac_managed=true`          | Administrator-authorized pool membership     |
+| `cf_<hostSelector key>=<value>` (×N) | Capability equality across all requested fields |
 | status=staged                   | Available allocation state                   |
 | `cf_osac_instance_id__empty=true` | Server-side empty-owner narrowing          |
-| `osac_instance_id` is empty     | Authoritative ownership check in adapter    |
+| Decoded pool, status, owner, and capability values | Candidate eligibility check in adapter |
 
-Multiple `tag=` parameters use AND semantics — only devices matching ALL
-specified tags are returned. The adapter then discards any returned device
-whose `osac_instance_id` is non-empty. The custom-field filter uses NetBox's
-`cf_` namespace and `__empty=true` lookup to narrow the response, while the
-client-side owner check remains authoritative if data is stale or an external
-edit causes status and owner to drift. This query filter does not prove that the
-custom field exists; startup schema validation separately verifies that
-`osac_instance_id` exists on `dcim.device` and supports the required filter.
+Custom-field query parameters narrow the response; they do not prove that a
+field exists or that its filter is enabled. Schema validation below prevents
+unknown or disabled filters from silently broadening selection. The adapter
+requires `osac_managed=true`, `status.value=staged`, an empty owner, and every
+requested capability value. Missing/null capabilities or mismatched types do
+not match. Additional unrelated fields do not disqualify a device. It continues
+through pages until a candidate is found or `next` is null, validating that any
+pagination URL stays on the configured HTTPS origin and device-list path.
 
 The resolved `spec.selector.hostSelector` map is populated from the
 `BareMetalInstanceType` by the fulfillment-service. NetBox uses the selector
-keys as exact tag slugs; the generic map values remain present for the shared
-inventory contract but are ignored by this backend:
+keys as exact custom-field names, preserving meaningful values:
 ```
-Input: {"osac-cpu-cores-16": "true", "osac-gpu-model-a100": "true"}
-Selector keys: ["osac-cpu-cores-16", "osac-gpu-model-a100"]
-Query params: &tag=osac-cpu-cores-16&tag=osac-gpu-model-a100
+Input: {"cpu_cores": "16", "gpu_model": "a100"}
+Query params: &cf_cpu_cores=16&cf_gpu_model=a100
 ```
 
 **Advantages:**
 - Server-side filtering: only matching pool and capability devices are returned by NetBox; reduced network payload
-- No client-side label parsing or matching code; only the owner field is checked client-side
-- Administrator-managed capability tags remain unchanged by allocation PATCHes
-- ETag protection covers the assignment PATCH and all device fields are preserved during updates
+- The selector retains the existing key/value meaning; field metadata supplies its NetBox type
+- Administrator-managed capability and pool fields remain unchanged by allocation PATCHes
+- ETag protection covers the assignment PATCH; fields other than allocation status and owner are preserved
 
 ### NetBox REST API Interactions
 
 **HTTP Client Pattern:**
-- Thin custom HTTP adapter using `net/http`. NetBox has an official generated Go client, but it is version-coupled to a NetBox OpenAPI schema and does not expose the per-request ETag capture and `If-Match` flow needed here. The adapter keeps URL construction, response sanitization, retry policy, and optimistic-locking behavior explicit. [Official client](https://github.com/netbox-community/go-netbox)
+- A small `net/http` adapter centralizes dynamic custom-field queries, version-compatible decoding, sanitized errors, bounded read retries, and conditional-write policy across the limited endpoint surface. The official generated SDK is also viable: it exposes HTTP responses for ETags and accepts a custom HTTP client, although conditional headers need customization. This choice avoids that extra wrapper; it is not a claim that the SDK cannot support the flow. [Official client configuration](https://github.com/netbox-community/go-netbox/blob/d187c662e8d4a9687197885d986ac3cd4f268b08/configuration.go#L76-L85)
 - Base URL: the configured HTTPS origin (e.g., `https://netbox.example.com`)
   with no path other than an optional trailing slash; the adapter trims the
   trailing slash and appends `/api/` exactly once. A configured `/api` path is
   rejected so requests cannot become `/api/api/...`.
-- Authentication: NetBox's classic token authentication in the `Authorization: Token <token>` header (the design does not use the word "Bearer" for this scheme)
+- Authentication: a NetBox v1 (classic) API token in the `Authorization: Token <token>` header; v2/Bearer tokens are outside this initial contract
 - TLS validation: system CA bundle + optional custom CA cert (injected into
   the `http.Client` Transport); non-HTTPS endpoints are rejected before a
   request is sent
 - Redirect policy: `http.Client.CheckRedirect` rejects any redirect that
   changes the scheme or authority from the configured origin, so the token is
   never sent to an HTTP endpoint or a different host
-- Timeout: 30s per request (configurable)
-- Retry logic: transient errors (5xx, network) up to 3 times; 412 Precondition Failed triggers race-loss path (not retried as transient — handled by caller); permanent errors (401, 403, 4xx validation) fail fast
-- ETag/`If-Match` protection requires NetBox 4.6 or newer; the supported point-release matrix is defined and tested before implementation. [NetBox REST API documentation](https://github.com/netbox-community/netbox/blob/main/docs/integrations/rest-api.md)
+- Timeout: 30s per request
+- Retry logic: read-only GET requests retry transient errors (5xx, network) up to 3 times. Conditional PATCH is never blindly replayed: timeout/network/5xx after submission is an uncertain outcome returned to reconciliation with the persisted host ID intact. The next detail read determines whether the claim/release committed. A direct 412 follows the method-specific race path; permanent 4xx errors fail fast.
+- ETag/`If-Match` protection requires the Community releases and acceptance gates in [NetBox Version Compatibility](#netbox-version-compatibility).
 
 **Key Endpoints:**
-- `GET /api/dcim/devices/` — List devices with filters (pool tag, hardware
-  tags, status, and `cf_osac_instance_id__empty=true`; the owner is still
-  checked in the adapter)
+- `GET /api/extras/custom-fields/` — Read and paginate field definitions for schema validation
+- `GET /api/dcim/devices/` — Select candidates using pool/capability custom fields, status, and `cf_osac_instance_id__empty=true`; separately query an exact `name` to validate uniqueness before selection/new claim
 - `GET /api/dcim/devices/{id}/` — Fetch single device; response includes ETag header for optimistic locking
 - `PATCH /api/dcim/devices/{id}/` — Set device status and update the owner custom field during assignment/unassignment. The body is a partial update under `custom_fields`, and the adapter preserves the other custom fields. It sends `If-Match` with the ETag from the prior GET to detect concurrent modifications (412 Precondition Failed on conflict).
 
@@ -301,107 +462,179 @@ Assignment and release payloads are:
 {"status":"staged","custom_fields":{"osac_instance_id":null}}
 ```
 
-These examples show only the fields changed by OSAC; before sending the
-PATCH, the adapter merges the current `custom_fields` map so unrelated NetBox
-custom fields are preserved.
+These are the complete partial-update bodies. NetBox merges the supplied
+custom-field entries with the stored map; the adapter sends only
+`osac_instance_id`, preserving pool, capabilities, BMC data, and unrelated
+metadata. It does not echo credentials into an allocation PATCH.
+[Community custom-field serializer](https://github.com/netbox-community/netbox/blob/main/netbox/extras/api/customfields.py)
 
 **Error Handling:**
 - 401 Unauthorized — Secret validation failure; permanent at the HTTP retry layer; actionable message
 - 403 Forbidden — Token lacks permissions; permanent at the HTTP retry layer; actionable message
-- 4xx validation (excluding 412) — Invalid query/filter; permanent at the HTTP retry layer; actionable message (must include field names for debugging)
-- 412 Precondition Failed — Concurrent modification detected (ETag mismatch); another operator or process modified the device since our last GET. In AssignHost: return (nil, nil) — treat as race loss. In UnassignHost: re-read device and retry from step 1.
+- 4xx validation (excluding 412) — Invalid query/filter; permanent at the HTTP retry layer; report the operation and validation category without raw responses or selector values
+- 412 Precondition Failed — The device changed since the eligibility read. AssignHost re-reads ownership: the same active owner resumes recovery, another owner or a clearly unassigned device permits `(nil, nil)`/reselection, and an unreadable/inconsistent state returns an error preserving the host ID. UnassignHost re-reads and rechecks ownership before retrying.
 - 5xx server error — Transient; retry with backoff
 - Network error (timeout, connection refused) — Transient; retry with backoff
 
 No secrets or tenant data are logged. Error messages use generic "unable to contact inventory backend" when exposing details would leak information.
 
-#### Label Matching Strategy
+### NetBox Version Compatibility
 
-**Approach: Server-side tag/status filtering with client-side ownership validation**
+NetBox Community 4.6.0 introduced the required ETag/`If-Match` support.
+Its conditional single-device update takes a row lock and compares the fresh
+ETag inside a database transaction before saving. The adapter requires the
+exact detail-GET ETag, never `*` or an unconditional PATCH.
+[Community conditional update](https://github.com/netbox-community/netbox/blob/v4.6.0/netbox/netbox/api/viewsets/__init__.py#L288-L302)
 
-Capability labels are pre-created NetBox tags. The pool membership tag, the
-selector-key tags, and `status=staged` are filtered server-side by the
-FindFreeHost API call. NetBox applies AND semantics on multiple `tag=`
-parameters. The adapter checks `osac_instance_id` in each returned device and
-skips assigned devices; it does not rely on custom-field filtering for
-correctness.
+The initial compatibility targets are Community **4.6.10 and 4.7.1**, pinned
+by image digest in the implementation's CI fixtures. Each becomes supported
+only after the real-API and E2E acceptance suites pass; source inspection is
+not a runtime compatibility result. No Enterprise feature or plugin is used.
+Dependencies are device list/detail/partial-update, native status, and custom
+fields. The decoder accepts selection values as strings (4.6) or
+`{value,label}` objects (4.7), and validates active field status when present.
+[4.7 selection serialization](https://github.com/netbox-community/netbox/blob/v4.7.1/netbox/extras/models/customfields.py#L387-L398)
 
-**Why capability tags plus a custom-field owner filter:**
-- Capability requirements are multi-valued and must be ANDed; NetBox's
-  documented repeated `tag=` filter provides that native semantics. The
-  owner custom field represents allocation state, not host capability.
-- The `cf_osac_instance_id__empty=true` filter further narrows the normal
-  candidate response, while the client-side check preserves correctness if
-  NetBox returns a stale or unexpectedly populated device
-- ETag-based optimistic locking protects the later assignment update and
-  preserves unrelated device metadata; it is not used to create or mutate
-  capability tags
+No runtime version endpoint query or version-dependent code paths are needed. The
+client requires the configured NetBox deployment to support ETag/`If-Match`;
+every assignment/release detail read must provide a nonempty ETag before a
+PATCH. An empty inventory can initialize successfully; startup cannot prove
+conditional writes without a device or perform a destructive probe.
+NetBox also exposes its API version in the `API-Version` response header, which
+can be retained for diagnostics, but the client does not branch on it at
+runtime.
+Any later NetBox release remains unsupported until its pinned compatibility
+image passes the same CI/E2E contract tests and is added to the matrix.
 
-This design does not claim a benchmarked performance advantage for tags over
-custom-field filtering. Tags are selected for their direct multi-tag matching
-semantics; the custom-field filter is only a response-size optimization and
-the client-side owner check remains authoritative. The API contract tests
-cover both filters and the large-pool scenarios should provide the baseline
-needed for a later scale decision.
+### Custom-Field Host Matching
 
-**Matching contract:**
-- The fulfillment-service resolves `BareMetalInstanceType.host_label_selector` into the CRD's `spec.selector.hostSelector` map (for example, `{"osac-cpu-cores-16": "true"}`)
-- The operator validates and sends each selector key unchanged as a NetBox `tag=` filter; it does not derive a tag from the key/value pair
-- Selector values must be non-empty for the shared CRD contract but are ignored by this backend because NetBox tags have no value component
-- NetBox API returns only devices matching ALL requested tags
-- Adapter discards devices whose `osac_instance_id` is already populated
-- A device with EXTRA tags beyond those requested is still a valid match (superset matching)
+**Approach: server-side custom-field equality with candidate validation**
 
-The `BareMetalInstanceType` is not a NetBox object and the
-fulfillment-service does not query NetBox while resolving it. For a deployment
-using this backend, the administrator authors the instance type's selector keys
-to match the pre-created NetBox tag slugs; the fulfillment-service copies the
-map without interpreting it, and only the NetBox adapter interprets the keys
-as tag filters. Other inventory backends continue to use both key and value
-according to their own matching contracts. We intentionally do not invent a
-`key:value` tag encoding: NetBox's tag filter already accepts one exact tag
-slug, so the key itself is the unambiguous tag identity and the non-empty map
-value is retained only for the shared selector schema.
+The instance type selector supplies separate capability names and values.
+For example, `cpu_cores: "16"` matches an integer field whose value is 16,
+and `gpu_model: "a100"` matches that exact text or stored selection value.
+NetBox combines the corresponding `cf_` filters with the fixed pool,
+status, and empty-owner filters. The adapter verifies the decoded result
+against the same predicates. [NetBox Community filtering](https://github.com/netbox-community/netbox/blob/main/docs/reference/filtering.md)
 
-**NetBox tag-key rules:**
-- The selector key is the exact pre-created NetBox tag slug; the operator does not add a prefix, lowercase it, or otherwise transform it
-- Keys must be non-empty and match the supported NetBox tag-slug character set; URL encoding is applied only when constructing the request
-- Selector values must be non-empty because the shared selector schema requires them, but changing a value does not change the NetBox query
+**Why custom fields:**
 
-**Validation:** reject an invalid or empty tag key before any NetBox request; do not silently normalize a key to a different tag. Values are validated only for the existing non-empty selector contract.
+- They preserve OSAC's key/value selectors and provide typed, named values in
+  NetBox's administrator interface. Values are not embedded in tag slugs.
+- An existing capability field can be reused when its name, type, and exact
+  filter meet this contract. New capability dimensions require administrator
+  field definitions and data, but no hardcoded adapter mapping.
+- Tags also support server-side filtering. Neither smaller responses nor a
+  measured performance advantage is exclusive to either representation.
+  This choice follows the selector semantics and administrator workflow.
+- OSAC writes only the owner field and native allocation status. Pool,
+  capability, BMC, and unrelated metadata remain administrator-managed.
+
+**Field names and values:**
+
+Keys are exact NetBox custom-field names: 1–50 ASCII letters, digits, or
+underscores, excluding double underscores. The adapter rejects empty keys,
+keys beginning with `cf_`, and the reserved integration fields
+`osac_managed`, `osac_instance_id`, `osac_bmc_username`,
+`osac_bmc_password`, `osac_bmc_address`, and `osac_boot_mac`.
+This prevents selectors from replacing pool/owner filters or supplying
+lookup suffixes such as `__empty` or `__gt`. Keys are never normalized or
+derived from hardware fields. Every value must be non-empty.
+
+The supported capability types are scalar `text`, `integer`, `boolean`,
+and `select`, all with `filter_logic=exact`:
+
+| NetBox field type | Selector value | Candidate comparison |
+|---|---|---|
+| Text / selection | Exact string or stored choice value, e.g. `"a100"`; no leading/trailing whitespace and no literal `"null"` | Exact, case-sensitive string equality; for selection fields decode the 4.6 string or the 4.7 `{value,label}` object's string `value`, never its display label |
+| Integer | Canonical base-10 signed 64-bit integer string, e.g. `"16"`; no leading zeros or plus sign | JSON integer equality without float conversion |
+| Boolean | Exactly `"true"` or `"false"` | JSON boolean equality; missing/null is neither true nor false |
+
+Unsupported types, including JSON containers, multiselect, object references,
+dates, and decimals, produce a selector configuration error. A provider can
+represent a capability value as exact text when typed arithmetic is unnecessary.
+The selector expresses equality; it does not infer minimum CPU/RAM quantities
+or ranges. The shared OSAC selector remains `map<string,string>`.
+Literal `"null"` is rejected for text/selection because Community filtering
+uses it as a missing/null sentinel; surrounding whitespace is rejected because
+string filters trim it. URL encoding cannot restore exact equality for either
+case. These are explicit configuration errors, not an empty-capacity result.
+[Community null filter](https://github.com/netbox-community/netbox/blob/v4.6.10/netbox/extras/filters.py#L56-L73)
+[Community field definitions and filters](https://github.com/netbox-community/netbox/blob/main/netbox/extras/models/customfields.py)
+
+**Schema validation and lifetime:**
+
+At startup, the operator paginates
+`GET /api/extras/custom-fields/?object_type=dcim.device`, checks the
+returned `object_types`, and validates the six fixed integration field
+definitions: pool, owner, and the four BMC fields. Pool and owner must permit
+unset values (`required=false`) and exact filtering; pool must be boolean
+with default false and owner must be text with no non-empty default. BMC
+definitions must be text; actual per-device BMC values are validated during
+assignment. The API represents `type` and `filter_logic` as choice objects;
+the adapter reads their `value` members. When field metadata contains `status`
+(introduced in 4.7), require `status.value=active`; provisioning or deleting
+fields are not usable. These read-only checks work inside
+the deployment network and need no access from Helm or Enclave Wizard.
+
+Capability keys arrive with each resolved selector and are not all known at
+startup. Each `FindFreeHost` call and each new-claim `AssignHost` refreshes the paginated field metadata,
+revalidates pool/owner definitions, and validates every requested capability's
+device association, supported type, and exact filtering before querying
+devices. Metadata is reused within that call only; a new or corrected
+instance type requires no operator restart. Failure to read or validate
+metadata returns an error, with no fallback to a less restrictive query.
+Missing fields, disabled/loose filtering, unsupported types, and invalid
+values are configuration errors, distinct from a valid query with no hosts.
+Administrators must coordinate schema edits with allocation; field-schema
+changes are not covered by a device ETag.
+[Community dynamic filter construction](https://github.com/netbox-community/netbox/blob/main/netbox/netbox/filtersets.py)
+
+The adapter sends exactly one `cf_<key>` parameter per selector entry,
+constructed with `url.Values.Set` and URL encoding. Extra device fields are
+allowed, but every requested field must match. Neither a tag nor a generic
+JSON capability map participates in matching. A schema change or unexpectedly broad
+API response cannot make a mismatching returned device eligible; the local
+typed checks reject it. These checks cannot compensate for a server query
+that omits an eligible device, so real Community API tests must verify the
+filters' completeness as well as their exclusion behavior.
 
 ### AssignHost Implementation
 
 **Normal Path (Happy Case):**
-0. Parse `inventoryHostID` and recover the numeric NetBox device ID from the validated `netbox-device-<id>` name; reject any other host-ID form.
-1. Read device from NetBox by ID and check assignment status. **Capture the ETag header from the response.**
+0. Validate the nonempty `instance.InstanceID`, required resource context, and positive numeric `instance.BackendID`. Parse `inventoryHostID` as the configured Metal3 namespace plus unchanged device name; require the complete persisted binding described above.
+1. Read the device by `instance.BackendID`; require its returned ID and name to match the binding and check assignment status. A missing or renamed device returns an error retaining the binding. Capture the nonempty ETag header; a missing ETag prevents any claim PATCH.
    - If status is `active` and `osac_instance_id` is the **same ID** → skip the NetBox claim PATCH and continue with the idempotent Secret/BMH ensure steps below
-   - If status is `active` with a **different/non-empty ID**, or status is not `staged` → return (nil, nil) — another request or external lifecycle action owns the device
-   - If status is `staged` and `osac_instance_id` is empty → proceed to step 2
+   - If the owner is this BMI but status is inconsistent → return an error and retain the recovery pointer for repair; do not reselect and abandon its claim
+   - Otherwise, any non-empty owner, a status other than `staged`, or `osac_managed` not equal to JSON boolean `true` → return (nil, nil), with no writes
+   - For an unclaimed device, refresh and validate field metadata for `instance.HostSelector` and recheck name uniqueness, then fetch the bound device again and retain that response's ETag. Recheck its ID/name and apply the same-owner recovery branch again if needed; otherwise recheck pool, status, empty owner, and every typed selector value together. An eligibility mismatch returns `(nil, nil)` so the controller clears the complete candidate binding and searches again; identity/schema/transport errors retain the binding and return an error. This also handles edits between discovery and assignment, including a restart before claiming.
 2. Extract BMC data: read `osac_bmc_username`, `osac_bmc_password`, `osac_bmc_address`, and `osac_boot_mac` from the device custom fields. Validate the address and MAC before changing the allocation marker.
-3. For an unassigned device, PATCH assignment: set `status = active` and `osac_instance_id = bareMetalInstanceID`. **Include `If-Match: <etag>` header from step 1.** If NetBox returns **412 Precondition Failed** → another process modified the device since our read; return (nil, nil) — treat as race loss. For an already-owned device, do not repeat this PATCH.
-4. Ensure the namespace-scoped BMC Secret through the existing `BMHLifecycleManager`, using the extracted username/password. The Secret name is deterministic from the NetBox device ID and is labeled as operator-managed.
-5. Create the BMH through the existing `BMHLifecycleManager`, passing the validated BMC address, Secret name, boot MAC, and BareMetalInstance consumer reference. The manager's `CreateBMH` operation is idempotent.
-6. Check readiness through the existing manager; return `Host.Ready = true/false`. NetBox does not perform power control, inspection, OS provisioning, or readiness transitions.
+3. For an unassigned device, PATCH assignment: set `status = active` and `osac_instance_id = instance.InstanceID`. Include the exact `If-Match` ETag from the eligibility-checked detail response. On **412**, re-read and validate the bound device identity and ownership before deciding race loss: the same active owner with unchanged name resumes at step 2 using the newly read BMC data and skips another claim PATCH; another owner or a clearly unassigned device permits `(nil, nil)` only when identity still matches. A renamed, unreadable, or inconsistent state returns an error preserving the binding. An earlier timed-out claim can have committed while a retry was in flight. For an already-owned device, do not repeat the claim PATCH.
+4. Ensure the namespace-scoped BMC Secret through `BMHLifecycleManager`, using the extracted username/password and trusted resource annotations. The Secret carries an operator-managed Kubernetes label and owner metadata identifying this BMI UID; refuse to overwrite an existing Secret owned by anyone else.
+5. Create the BMH through `BMHLifecycleManager`, passing the validated BMC address, Secret name, boot MAC, annotations, and full BareMetalInstance consumer reference including UID. Idempotent reuse requires matching ownership, including the UID, and a non-terminating object.
+6. Check readiness through the existing manager; return `Host.Ready = true/false`, `HostClass=metal3`, and the unchanged bound host name/IDs. The controller sets BMI `HostClass` only after readiness, preserving its existing gate. NetBox does not perform power control, inspection, OS provisioning, or readiness transitions.
 
-If an adapter-side preparation step after the NetBox claim fails (for example,
-creating the operator-managed BMC Secret or BareMetalHost), the client runs an
-internal compensation path before returning the error: it deletes only a BMH
-whose consumer reference matches the current BareMetalInstance, deletes only
-the operator-managed BMC Secret, then re-reads the device and clears the
-NetBox claim with `If-Match`. A failed cleanup or an ownership mismatch leaves
-the claim in place and is retried safely rather than risking another instance's
-resources. `Host.Ready = false` and a transient readiness-read error are not
-preparation failures; the claim and same-owner BMH/Secret are retained so the
-existing controller can requeue and continue. This compensation path is what
-satisfies the PRD requirement to release a host when adapter-side preparation
-fails; provisioning failures handled after this boundary remain part of the
-existing BareMetalInstance lifecycle and are released by normal deallocation.
+If BMC Secret or BMH preparation fails after the claim, `AssignHost` returns
+a typed `PreparationFailed` error without starting destructive compensation.
+The controller persists cleanup state `compensating`, then routes subsequent
+reconciliations through `UnassignHost` until rollback completes. A failed
+checkpoint update permits no cleanup side effect. This prevents a restart or
+pending deletion from re-entering the same-owner resource-creation path.
+Cleanup removes only this BMI's BMH/Secret, observes disappearance, checkpoints
+that fact, then conditionally clears its claim. After success, the controller
+clears the cleanup state and full candidate binding in one update before a
+new search. Errors retain the state/binding for safe retry. `Host.Ready=false`
+and transient readiness-read errors are not preparation failures and retain
+the normal assignment retry path. Failures after this adapter boundary use
+the existing provisioning/deallocation lifecycle.
 
 **Idempotency Contract (Safe for Unlimited Retries):**
-- Every call starts by reading device and checking current assignment
+- If persisted cleanup is in progress, the controller continues UnassignHost;
+  AssignHost rejects nonempty CleanupState without preparing resources
+- Otherwise every call starts by reading device and checking current assignment
 - If status is `active` and already assigned to the same ID → skip the ownership write, but repeat the idempotent Secret/BMH ensure and readiness checks
-- If status is `active` with a different/non-empty ID, or status is not `staged` → return (nil, nil) without writing
+- For a new claim, require pool membership, `staged`, an empty owner, and the persisted selector's typed capabilities on the same detail response used for the conditional PATCH
+- Same-owner active retries and release remain possible even if an administrator removes pool membership after allocation
 - This makes the entire flow idempotent across retries, transient failures, and crashes
 
 **Race Condition Handling (Concurrent Requests with ETag Protection):**
@@ -410,96 +643,160 @@ existing BareMetalInstance lifecycle and are released by normal deallocation.
 - B's `AssignHost` reads device (step 1), captures ETag_v1
 - A's PATCH includes `If-Match: ETag_v1` → succeeds (first writer wins); NetBox updates device and returns new ETag_v2
 - B's PATCH includes `If-Match: ETag_v1` → fails with 412 Precondition Failed (device was modified since B's read)
-- B's `AssignHost` returns (nil, nil); caller retries `FindFreeHost`
+- B re-reads and observes A's different owner; `AssignHost` returns `(nil, nil)` and the caller retries `FindFreeHost`
 - Result: true first-writer-wins semantics; no silent overwrites; race detected at conditional PATCH time
 
 **Transient Failure Recovery (PATCH Fails):**
 - PATCH fails with 5xx, timeout, or network error
-- Controller requeues with exponential backoff
+- Do not automatically resend the PATCH with its old ETag: a committed write whose response was lost would otherwise return 412 and be mistaken for another claimant
+- Return an error and retain the complete host ID/name/numeric-ID binding; controller requeues with exponential backoff
 - Next reconciliation retries `AssignHost`
-- Step 1 finds device already has correct `osac_instance_id` → returns cached state without retrying writes
+- Step 1 finds the same owner → skips the claim write and resumes Secret/BMH ensure and readiness checks; there is no cached assignment result
+- If that read precedes a delayed earlier commit, a subsequent PATCH may return 412. The ownership read in the 412 path recognizes this BMI's eventual claim and preserves it. A failed verification read returns an error, never permission to discard the recovery pointer.
 
 **Crash Recovery (Operator Restart):**
-- Crash after `FindFreeHost` but before recording `ExternalHostID`:
+- Crash after `FindFreeHost` but before persisting the host binding:
   - No state changes anywhere; reconciliation restarts from `FindFreeHost`
-- Crash after recording `ExternalHostID` but before `AssignHost` PATCH:
-  - CR has `ExternalHostID` set; NetBox device is still unassigned
-  - On restart, controller sees `ExternalHostID`, skips `FindFreeHost`, calls `AssignHost` directly → normal assignment proceeds
-  - If device was claimed by another request in the meantime: `AssignHost` returns (nil, nil); controller clears `ExternalHostID` and retries `FindFreeHost`
+- Crash after persisting the host binding but before `AssignHost` PATCH:
+  - CR has host ID/name and numeric-ID annotation set together; NetBox is still unassigned
+  - On restart, the controller validates the complete binding, skips `FindFreeHost`, and calls `AssignHost` using the persisted numeric ID
+  - If another request claimed the device: `AssignHost` returns (nil, nil); the controller clears all three binding values together before retrying `FindFreeHost`
 - Crash after `AssignHost` PATCH succeeds:
-  - Both CR (`ExternalHostID`) and NetBox (`status=active`, `osac_instance_id`) are consistent
+  - Both CR (complete persisted binding) and NetBox (`status=active`, `osac_instance_id`) are consistent
   - On restart, `AssignHost` step 1 finds matching assignment → skips the ownership write, ensures the Secret/BMH, and reconciliation continues to provisioning
 
 ### UnassignHost Implementation
 
+**Persisted cleanup checkpoints:** Before entering this method, the controller
+records `releasing` for deletion or `compensating` for preparation rollback in
+the BMI cleanup annotation. If deletion starts during compensation, retain
+its progress and complete cleanup for deletion instead of allocating again.
+The corresponding `releasing-ready` / `compensating-ready` states mean both
+owned Kubernetes resources were observed absent before the NetBox release
+attempt. These four values are the only accepted nonempty states.
+
 **Normal Path (Happy Case):**
-0. Parse `inventoryHostID` and recover the numeric NetBox device ID from the validated `netbox-device-<id>` name; reject any other host-ID form.
-1. Read device and check assignment. **Capture the ETag header.**
-   - If status is `staged` and `osac_instance_id` is empty → return success (already unassigned)
-   - If status is `active` and `osac_instance_id` is non-empty → ask the BMH manager for the existing BMH `ConsumerRef`. If a BMH exists, its consumer ID must equal the NetBox owner; otherwise return an ownership-conflict error without deleting anything. If the BMH is absent, the inventory finalizer continues the deterministic cleanup for this host ID.
-2. Delete BMH: call `bmhManager.DeleteBMH()` to remove Metal3 BareMetalHost CR (device remains assigned in NetBox during cleanup)
-3. Delete Secret: call `bmhManager.DeleteBMCSecret()` to remove BMC credentials
-4. Clear assignment: PATCH NetBox to set `status = staged` and clear `osac_instance_id`. **Include `If-Match: <etag>` header from step 1.** If NetBox returns **412 Precondition Failed** → re-read device and retry from step 1 (another process modified the device concurrently).
+0. Validate the nonempty requesting `instance.InstanceID`, persisted numeric `BackendID`, saved namespace/name binding, and one of the four persisted cleanup states. Missing or unknown cleanup state cannot authorize destructive cleanup.
+1. Read the device by the persisted numeric ID, never by name. A rename does
+   not change the cleanup target. A nonempty owner must equal the requesting BMI UID;
+   otherwise return an ownership-conflict error with no writes or deletes,
+   except for the completed-cleanup recovery rule below.
+   `staged` plus empty owner and no residual resources is already released.
+   Other inconsistent status/owner combinations fail closed for operator
+   repair. Pool membership and capability changes do not block release.
+2. For an active claim owned by this BMI, inspect the existing BMH and BMC
+   Secret. Require matching `ConsumerRef.UID` and Secret owner metadata before
+   cleanup; an operator-managed Kubernetes label alone is insufficient. Missing objects
+   are safe for crash recovery. Refuse foreign or ownerless residual objects.
+3. Delete only that BMH with Kubernetes UID/resourceVersion preconditions.
+   `DeleteBMH()` currently returns when DELETE is accepted, so add a
+   direct API-server absence check: while the BMH exists or is terminating, return a retriable
+   cleanup-pending error. Retain its credentials and the NetBox claim.
+4. Once the BMH is absent, delete only its owned BMC Secret with object
+   preconditions and verify absence using an uncached API-server read. A pending/failed deletion retains the
+   NetBox claim and inventory finalizer for the next reconciliation.
+5. Once both resources are absent, if the persisted state is not yet the
+   corresponding `*-ready` state, return typed `CleanupCheckpointRequired`
+   without releasing NetBox. The controller saves that state in the BMI and
+   retries; write failure leaves the claim and finalizer intact.
+6. Re-read the device and recheck the requesting owner and resource absence.
+   If still owned by this
+   BMI, PATCH `status=staged` and `osac_instance_id=null` with this fresh,
+   nonempty ETag. A 412 retries from step 1; never replace the ETag without
+   rechecking ownership. If already released and resources are absent,
+   return success. Do not mutate a different owner's claim or resources.
+
+**Release completed before a crash:** With a persisted `*-ready` checkpoint,
+a retry may find staged/empty state, or an active device already claimed by
+another BMI. Use direct Kubernetes reads to confirm no BMH or Secret at the
+bound names is still owned by the releasing UID; missing resources or clearly
+foreign-owned replacements require no deletion. Then report cleanup complete
+without writing NetBox or touching replacements. Ownerless/inconsistent
+resources or a reappearing resource owned by the old UID fail closed for
+repair. Without the checkpoint, a different owner is still an ownership error.
+The checkpoint proves prior resource cleanup, not permission to clear another
+claim. This handles a successful or lost-response release followed by
+reallocation before the old BMI's finalizer is removed.
+
+The controller keeps the full binding/checkpoint until it removes the inventory
+finalizer (normal deletion), or atomically clears them for a new search after
+compensation. `PreparationFailed` and `CleanupCheckpointRequired` are typed
+internal error results on the existing error returns, not new tenant APIs;
+the controller handles them before its generic error path. Neither checkpoint
+is written by the NetBox adapter directly to the BMI.
 
 **Idempotency Contract:**
 - Same read-first pattern as AssignHost
-- Every retry starts by checking device state
+- Every retry uses persisted cleanup progress and checks device state
 - Safe for multiple retries without duplicate writes
 - ETag-based `If-Match` on PATCH prevents concurrent modification; 412 triggers re-read and retry (safe because unassignment is idempotent)
-- Because `UnassignHost` has no bare-metal-instance-ID parameter, the existing BMH `ConsumerRef`/NetBox owner comparison is the ownership guard available at this interface boundary; it prevents cleanup from deleting a BMH that belongs to a different BareMetalInstance
+- The requesting UID is mandatory: agreement between a BMH consumer and a NetBox owner does not authorize a different BMI's deletion. A candidate selected but never claimed cannot release a subsequent claimant's host.
 
 ### Metal3 BareMetalHost Lifecycle
 
-The NetBox adapter reuses the existing `baremetalhost.Manager` used by the BMF operator. Its responsibility is to translate NetBox's BMC metadata into the manager's `CreateParams`; the manager and Metal3 controller handle Kubernetes objects, power management, inspection, and readiness reporting. The manager gains an internal `GetBMHConsumerID(name)` helper for the release-time ownership guard above; NotFound means that the deterministic BMH is absent. This is an internal helper and does not change `inventory.Client` or the top-level reconciler. This keeps the implementation within locked decision D4: NetBox is the inventory source, while OS provisioning and BMH readiness remain existing Metal3 responsibilities.
+The adapter translates NetBox BMC metadata into `baremetalhost.Manager`
+operations; Metal3 continues to handle power, inspection, provisioning, and
+readiness (D4). The internal manager gains ownership-aware NetBox operations:
+pass trusted annotations and a UID-bearing consumer reference on creation,
+read ownership/deletion state, refuse foreign-resource updates, and delete
+with object preconditions while observing completion. Ownership and absence
+decisions use uncached API-server reads, including after uncertain creates;
+the existing cached `BMHExists` result is insufficient. Existing helper behavior
+does not by itself provide these guarantees; the implementation adds and tests
+them without changing other backends' existing resource behavior.
 
 **Key Properties:**
 
-- **Coupled lifecycle** — Inventory allocation and BMH creation happen together (steps 4-6 in AssignHost); the device remains claimed while preparation is in progress, and a failed preparation is compensated before the error is returned
+- **Coupled lifecycle** — Inventory allocation and BMH creation happen together (steps 4-6 in AssignHost); a preparation failure retains the claim while the controller checkpoints and completes compensation before another allocation attempt
 - **Idempotent** — `EnsureBMCSecret()` and `CreateBMH()` are idempotent; crash recovery finds existing objects and reuses them
-- **Ordered deallocation** — BMH and its operator-managed Secret are deleted before the NetBox allocation marker is cleared (UnassignHost steps 2-4)
+- **Ordered deallocation** — BMH and its operator-managed Secret are deleted and their absence checkpointed before the NetBox allocation marker is cleared
 - **Readiness reporting** — the existing manager reads BMH status; `AssignHost` returns that status to the caller while the controller requeues until ready
 
 **BMC Credential Security:**
 
 - NetBox stores the configured per-device BMC metadata; it remains the source of truth for the adapter. Because NetBox custom fields are not a secret store, the NetBox API token must be restricted to the operator's device read/update permissions and NetBox roles must restrict who can view these fields.
 - Credentials are fetched only during assignment and passed to the existing manager, which creates a namespace-scoped, operator-managed Kubernetes Secret for the BMH
-- The Secret is labeled for cleanup and deleted during deallocation; the NetBox adapter never logs or writes the credential values back to NetBox
+- The Secret carries a Kubernetes label for cleanup and is deleted during deallocation; the NetBox adapter never logs or writes the credential values back to NetBox
 - Reuses the existing Metal3/BMH integration without adding provisioning logic to the NetBox backend
 
 ### TLS and Credential Security
 
 **Credential Management:**
 - API token stored in the Helm-created Kubernetes Secret `osac-netbox-api-token`, key `token`
-- Secret is mounted read-only at `/etc/osac/secrets/<tokenSecret>/`; the client reads `/etc/osac/secrets/<tokenSecret>/token`
+- Helm mounts key `token` read-only at `/etc/osac/secrets/<bmf.secrets.netboxToken>/token` and renders that full path as `tokenFile`; the operator reads the file, not the Kubernetes Secret API
 - Operator constructs the HTTP client with the `Authorization: Token <token>` header
 - Token never logged; errors sanitized to hide sensitive values
 
 **TLS Configuration:**
 - System CA bundle used by default
-- Optional custom CA cert provided in the Helm-created `osac-netbox-ca` Secret, key `ca.crt`, and mounted read-only at `/etc/osac/secrets/<caCertSecret>/ca.crt` alongside the token
+- Optional custom CA cert provided in the Helm-created `osac-netbox-ca` Secret, key `ca.crt`; Helm renders its mounted path as `caCertFile`
 - Certificate pinning not supported in initial implementation
 - Self-signed cert support: Cloud Infrastructure Admin provides CA cert; operator adds to `http.Client.Transport.TLSClientConfig`
 
 **Validation at Startup:**
 - Operator reads configuration on startup
-- Parses the configured URL, loads the token and optional CA Secret, and builds the authenticated HTTP client
-- Performs read-only NetBox API requests that validate connectivity, authentication, and the required `osac_instance_id` custom field (including its `dcim.device` assignment, text/nullable shape, and filtering support)
+- Parses the configured URL, reads the required `tokenFile` and optional `caCertFile`, and builds the authenticated HTTP client
+- Missing/unreadable/empty token files and explicitly configured unreadable/invalid PEM CA files fail initialization. An omitted CA path uses system trust; a bad configured CA never silently falls back. Credential paths are file paths, never interpreted as Secret names. The client loads them once; rotation requires an explicit operator restart.
+- Performs read-only NetBox API requests that validate connectivity, authentication, and the fixed integration field definitions described in [Schema validation and lifetime](#custom-field-host-matching)
 - Fails backend initialization on invalid URL, TLS/connectivity failure, 401/403, or missing required custom field; no allocation is attempted with an unvalidated backend
 - Permission to perform the allocation PATCH is verified by the first real assignment; the token is documented with the required read/update device permissions
 
 ### Configuration via Helm Values and Enclave Wizard
 
-NetBox backend **requires Metal3 for power management and host provisioning**. Both must be configured. This is the only canonical values shape; the earlier workflow example and the chart templates use these same names.
+NetBox uses Metal3 for power management and host provisioning. Enabling
+`bmf.netbox.enabled` selects the complete combination automatically; a second
+enable flag is not required. `bmf.metal3.namespace` remains the single namespace
+setting for management, the injected BMH manager, and its BMC Secret Role.
 
-The `bmf` subchart adds a `netbox` backend alongside its existing `metal3`
-management configuration. The existing chart uses `metal3.enabled` for both
-Metal3 inventory and management templates, so the implementation must avoid
-rendering two objects with the same `secrets.inventoryConfig` name: when both
-`netbox.enabled` and `metal3.enabled` are true, the NetBox template owns
-`inventory.yaml`, while the Metal3 template renders only `management.yaml`.
-When NetBox is disabled, the existing Metal3-only behavior remains unchanged.
-The namespace-scoped BMC Secret Role and the operator's Secret volume mounts
-are enabled for the NetBox-plus-Metal3 combination as well.
+The BMF chart rejects NetBox combined with another inventory selection:
+`metal3.enabled`, `bcm.enabled`, or the umbrella's fake Metal3 test backend.
+These flags select inventories, not independent management add-ons. For
+valid values, render NetBox inventory when `netbox.enabled`, Metal3 inventory
+when `metal3.enabled`, and Metal3 management when either is enabled. An omitted
+or false Metal3 flag therefore works with NetBox without duplicate configuration
+Secrets. Existing non-NetBox rendering remains unchanged.
+Enable NetBox token/CA mounts and the namespace-scoped BMC Secret Role for
+NetBox independently of `metal3.enabled`.
 
 ```yaml
 bmf:
@@ -513,18 +810,16 @@ bmf:
     endpoint: "https://netbox.example.com"
     token: ""                 # supplied with --set-file
     caCert: ""               # optional; supplied with --set-file
-    hostClass: "netbox"
   metal3:
-    enabled: true
     namespace: "baremetal"
-    hostClass: "metal3"
 ```
 
 The chart creates `bmf.secrets.netboxToken` with key `token`, creates
 `bmf.secrets.netboxCA` with key `ca.crt` when `caCert` is non-empty, and
-renders `bmf.secrets.inventoryConfig` with the `options.netbox` references
-shown above. When no CA is supplied, `caCertSecret` and its volume mount are
-omitted. The Deployment mounts the backend Secrets read-only below a
+renders `bmf.secrets.inventoryConfig` with the `options.netbox` file paths
+shown above and fixed `hostClass: metal3`. There is no NetBox host-class
+override. When no CA is supplied, its Secret, `caCertFile`, volume, and mount
+are omitted. The Deployment mounts the backend Secrets read-only below a
 deterministic path derived from each Secret name, following the existing BMF
 certificate-volume pattern; the client reads the fixed `token` and `ca.crt`
 files from those mounts. This follows the existing BMF `bcm.*` plus
@@ -535,6 +830,23 @@ BMC fields from the selected NetBox device and calls the existing
 `baremetalhost.Manager.EnsureBMCSecret`; that namespace-scoped Secret is
 created only when a host is assigned, then deleted by `UnassignHost`.
 
+The same enablement renders this management configuration into
+`bmf.secrets.managementConfig`:
+
+```yaml
+name: metal3-management
+type: metal3
+options:
+  metal3:
+    namespace: "baremetal"
+```
+
+The startup factory explicitly injects the BMH manager into the NetBox client,
+as it does for BCM; a registry-only constructor cannot supply that dependency.
+It parses the namespace from management configuration, not another NetBox
+option. Extend the existing BCM-only BMC Secret Role/RoleBinding gate for
+NetBox, retaining `get/create/update/delete` and uncached Secret operations.
+
 Sensitive values are supplied with `--set-file` (or an equivalent protected values mechanism), for example:
 
 ```bash
@@ -544,9 +856,10 @@ helm upgrade --install osac ./charts/osac -f values.yaml \
 ```
 
 **Validation at deployment:**
-- Helm validates that `netbox.enabled` has an endpoint and token, and that `metal3.enabled` has a namespace
-- The chart renders the inventory and management configuration Secrets; it does not contact NetBox or inspect the cluster's Metal3 runtime
+- Standalone chart validation and the umbrella `values.schema.json` require an HTTPS endpoint, nonempty token, and Metal3 namespace when NetBox is enabled; conflicting backend selections fail rendering. The NetBox values, Secret names, descriptions, and optional CA are declared in the umbrella schema for Wizard consumption.
+- Rendering creates the configuration/credential Secrets and mounts without contacting NetBox or the Metal3 runtime. If the existing installer pre-install validation hook is enabled, its Metal3 checks and corresponding `provisionings` RBAC are enabled by NetBox too, subject to BMaaS enablement. This is an in-cluster prerequisite check, not a Wizard or NetBox connectivity probe.
 - Operator startup performs the runtime validation contract above
+- After changing credentials or configuration with Helm, explicitly restart the BMF Deployment; a Secret-only Helm upgrade does not guarantee a rollout. The restarted operator rereads the files and repeats startup validation. Endpoint/namespace changes require a prior drain, because saved device IDs are tied to that inventory.
 
 Optional Enclave Wizard integration (pre-deployment):
 
@@ -561,7 +874,8 @@ component. Deployments may use Helm directly.
 **Startup validation contract (operator initialization):**
 - Authentication failures (401, 403): detected at operator startup; backend initialization fails with an actionable message
 - Connectivity failures: detected at operator startup; operator fails fast
-- Schema validation failures (`osac_instance_id` missing or incompatible with the required `dcim.device` text/nullable/exact-filter contract): detected at operator startup; operator fails fast
+- Fixed-schema failures (missing/incompatible pool, owner, or BMC field definitions on `dcim.device`): detected at operator startup; operator fails fast
+- Capability definitions are validated per `FindFreeHost` and again before a new claim, when the resolved selector is known; invalid selectors fail before listing devices or writing a claim
 - Invalid endpoint URL: detected at operator startup; operator fails fast
 - Result: if the backend initializes successfully, NetBox is reachable, authenticated, and has the required schema; Enclave Wizard is not a runtime dependency
 
@@ -571,13 +885,13 @@ Cloud Infrastructure Admin receives clear, actionable messages:
 
 - **At startup:** "NetBox backend initialized"
 - **On connectivity failure:** "Failed to connect to NetBox API: request timeout after 30s. Check endpoint URL and network connectivity."
-- **On auth failure:** "NetBox API authentication failed. Verify API token in Secret osac-netbox-api-token is valid and has permissions to read/update devices."
+- **On auth failure:** "NetBox API authentication failed. Check the mounted token configured by tokenFile and its device read/update permissions."
 
 ## Security Considerations
 
 ### Tenant Isolation
 
-No tenant-identifying data is recorded in NetBox. Assignment identifier is OSAC-internal (BareMetalInstance UID or UUID); NetBox stores only the assignment ID, not tenant name or namespace. [PRD: In Scope — no tenant-identifying data in NetBox]
+No tenant-identifying data is recorded in NetBox. The assignment identifier is the Kubernetes BareMetalInstance UID; NetBox stores only that ID, not tenant name or namespace. [PRD: In Scope — no tenant-identifying data in NetBox]
 
 Tenant users cannot see which backend is in use or any NetBox state; allocation is transparent. Network namespace or firewall rules may restrict NetBox API access to OSAC control plane only. [PRD: In Scope — tenant transparency]
 
@@ -591,27 +905,26 @@ resolved map to the inventory backend. When no instance type is referenced,
 the existing legacy template fallback remains the source of the resolved
 selector. The tenant-facing request selects the published type or catalog
 entry through the existing API; the tenant does not need to know the NetBox
-tag mapping.
+custom-field representation.
 
-For NetBox, the adapter takes each selector **key** as the exact tag slug to
-send in the query; it does not convert a key/value pair into a new slug. The
-map value is required to be non-empty by the shared BMF schema but is ignored
-by this backend because NetBox tag matching is name/slug based. Input
-validation requirements:
-
-- Each selector key must be non-empty and must be the pre-created NetBox tag slug; the adapter does not add a prefix, lowercase text, replace underscores, or combine the key with the value.
-- Selector values must be non-empty for the shared `hostSelector` contract, but changing a value does not change the NetBox query.
-- A key rejected by the BMF/NetBox tag-slug contract is rejected before a device query; an absent but syntactically valid tag simply produces no matching devices.
-- URL encoding is applied by `url.Values` to the exact key before constructing the request, preventing query-string injection without changing the tag identity.
+The adapter applies the [field-name, type, and schema rules](#custom-field-host-matching)
+before constructing a device query. It adds only `cf_` to each validated
+field name and uses the supplied value. Lookup suffixes and reserved
+integration fields are rejected; encoding a value such as `a100&status=active`
+must keep it inside one value and cannot change the fixed status or pool filter.
+An unknown field is a configuration error; a known field with no matching
+devices is ordinary capacity exhaustion.
 
 NetBox queries constructed defensively:
 ```go
 params := url.Values{}
-params.Add("tag", "managed-by-osac")
-params.Add("tag", "osac-cpu-cores-16")
-params.Add("status", "staged")
+params.Set("cf_osac_managed", "true")
+params.Set("status", "staged")
+params.Set("cf_osac_instance_id__empty", "true")
+for key, value := range validatedSelector {
+    params.Set("cf_"+key, value)
+}
 requestURL.RawQuery = params.Encode()
-// Result: tag=managed-by-osac&tag=osac-cpu-cores-16&status=staged
 ```
 
 ### Authorization
@@ -622,19 +935,41 @@ OSAC trusts NetBox API token to enforce authorization. Token should have read/up
 
 The per-method sections above are normative for request ordering, idempotency, race handling, and crash recovery. This section summarizes only the controller-level policy:
 
-- The HTTP adapter retries transient 5xx and network failures up to three times per request. After that budget is exhausted, the existing reconciliation lifecycle requeues the BareMetalInstance with its normal backoff. “Permanent” HTTP errors are not retried within the request, but a runtime credential revocation still follows the controller's normal error backoff; startup validation catches the usual misconfiguration before allocation.
+- The HTTP adapter retries transient GET failures up to three times. An uncertain PATCH outcome is returned without transport replay, preserving the recovery pointer until the next ownership read. The existing reconciliation lifecycle requeues with normal backoff. “Permanent” HTTP errors are not retried within the request, but runtime credential revocation still follows controller backoff; startup validation catches usual misconfiguration before allocation.
 - `FindFreeHost` returning `(nil, nil)` is expected capacity exhaustion, not a NetBox error. The existing controller reports no matching hosts and polls again using `NoFreeHostsPollIntervalDuration`.
-- A 412 response follows the method-specific race paths above: `AssignHost` returns no host so the controller selects again; `UnassignHost` re-reads and retries without clearing another instance's assignment.
+- A 412 response follows the owner-checked method paths above: assignment confirms whether this BMI owns the device before selecting again; release re-reads without clearing another instance's assignment.
 - Startup URL, TLS, authentication, and required-field failures prevent backend initialization. In this initial design, correcting the mounted Secret requires an operator restart so the client is rebuilt and startup validation runs again.
 - `UnassignHost` clears the NetBox marker only after the existing Metal3 manager has completed BMH and operator-managed Secret cleanup. A cleanup failure therefore leaves the marker set and is retried safely.
-- If adapter-side BMC Secret or BMH preparation fails after a claim, the compensation path removes only resources owned by the current BareMetalInstance and clears the claim with `If-Match`; if safe cleanup cannot be proven, the claim remains for retry and operator intervention.
+- If adapter-side BMC Secret or BMH preparation fails after a claim, the controller persists compensation intent before cleanup. Retries finish that cleanup rather than recreating a BMH. Resource-absence checkpoints allow completion after a lost release response and subsequent reallocation, without changing the new owner's resources.
 - All retry paths are idempotent: the assignment field, `ExternalHostID`, BMH, and BMC Secret are checked before repeating a write or create operation.
+- Missing/malformed identity bindings, invalid/duplicate names, and renamed or missing bound devices are configuration/identity errors, not capacity exhaustion. Preserve the complete binding on errors; numeric-ID-based release cannot switch to a same-named replacement.
 
 ## RBAC / Tenancy
 
-No changes to RBAC or tenancy model. Existing BareMetalInstance RBAC applies unchanged.
-Tenant data handling is covered under [Tenant Isolation](#tenant-isolation);
-the NetBox token authorization boundary is covered under [Authorization](#authorization).
+Existing tenant-facing BareMetalInstance RBAC remains unchanged. The BMF
+service account retains its existing cluster-scoped BMH/HardwareData access;
+the adapter restricts operations to its configured Metal3 namespace. Extend
+the existing namespace-scoped BMC Secret lifecycle Role to NetBox; no
+cluster-wide Secret list/watch is added. File-based token/CA loading needs
+no separate Kubernetes Secret-read grant. The BMC Role covers Secrets in its
+namespace, so platform credential separation still depends on namespace/RBAC
+placement, not on the file-loading choice alone.
+Per-host BMHs and BMC Secrets carry `osac.openshift.io/tenant` and
+`osac.openshift.io/owner-reference` annotations supplied by the controller.
+It copies the trusted BMI tenant annotation and sets the owner-reference
+annotation to the BMI's Kubernetes UID, rather than copying a possibly absent
+owner annotation or accepting the separate assignment metadata as authority. The BMH's full
+`ConsumerRef` additionally records the BMI name, namespace, kind, and UID;
+cross-namespace Kubernetes ownerReferences are not used. Missing or
+conflicting ownership metadata prevents resource creation/reuse. The manager
+must propagate these annotations; its current helpers do not do so.
+Chart-owned token/CA/configuration Secrets are platform-scoped and remain
+Helm-owned, never per-tenant resources. No tenant metadata is sent to NetBox.
+The BMI device-ID annotation is written by the trusted controller from the
+inventory result and preserved on subsequent reconciliation, not populated
+from tenant requests or assignment labels. It supplies a lookup target, never
+ownership authority: the requesting BMI UID is still checked before writes.
+The NetBox token authorization boundary is covered under [Authorization](#authorization).
 
 ## Observability and Monitoring
 
@@ -642,11 +977,14 @@ the NetBox token authorization boundary is covered under [Authorization](#author
 
 New Prometheus metrics emitted by NetBox backend:
 
-| Metric | Type | Labels | Meaning |
+| Metric | Type | Prometheus labels | Meaning |
 |--------|------|--------|---------|
-| `osac_netbox_hosts_available` | gauge | `host_class` | Total count of available devices in the pool (tag=managed-by-osac, status=staged, and empty `osac_instance_id`); computed by paginating the server-side pool query and applying the owner check |
 | `osac_netbox_assignment_attempts_total` | counter | `result` | Total AssignHost attempts; result = success/race/error |
 | `osac_netbox_api_errors_total` | counter | `error_type` | Total API errors by type (401, 403, 5xx, timeout) |
+
+Pool-wide capacity/usage monitoring is deferred to a separate cross-backend
+metrics feature. This backend does not scan the entire pool to publish a
+capacity gauge; `FindFreeHost` can stop at the first eligible candidate.
 
 Cross-backend host-search and assignment latency metrics are not defined by
 this backend-specific design. They should be added at the shared controller
@@ -656,12 +994,12 @@ boundary so BCM, OpenStack, Metal3, and NetBox expose the same measurements.
 
 The NetBox adapter and the shared allocation-path logs include:
 - `host_selector_key_count` — number of keys in the resolved `spec.selector.hostSelector`
-- `query_tag_count` — number of tags sent to NetBox for this request
-- `matching_devices_count` — count of devices returned by NetBox matching the server-side pool/tag filters
+- `query_capability_filter_count` — number of capability custom-field filters, excluding fixed pool/status/owner filters
+- `matching_devices_count` — count of inspected candidates passing the checks in this search, not total pool capacity
 - `host_selected` — whether a candidate was selected
 - `netbox_api_error` — error type/code (never token value or full response)
 
-Selector values, raw tag slugs, host IDs, BareMetalInstance UIDs, tenant data,
+Selector keys/values, full query URLs, host IDs, BareMetalInstance UIDs, tenant data,
 and credential details are not logged. The implementation must replace the
 generic controller's existing raw `matchExpressions` and `InventoryHostID`
 fields with these safe counts/booleans/error codes on the NetBox allocation
@@ -675,8 +1013,10 @@ behavior.
 | NetBox API incompatibility across versions | Features broken in upgrades | Require NetBox 4.6+ for ETag/`If-Match`; document and test the supported point-release matrix in CI |
 | Credential exposure via error messages | Security breach | Audit all error paths; sanitize NetBox error responses; never log API responses |
 | NetBox network partition | Allocation blocked until recovery | Graceful degradation: timeout after 30s; requeue BareMetalInstance; no tenant-visible difference |
-| External status edit on an OSAC-managed device | A claimed device can look available or an available device can be hidden from allocation | Treat only `staged` + empty owner as allocatable, preserve the owner under `If-Match`, and document that OSAC owns the allocation status for tagged devices |
-| Race between AssignHost and UnassignHost | Device simultaneously assigned and deallocated; inconsistent state | Idempotent operations: status and owner are updated under `If-Match`; AssignHost detects existing ownership; UnassignHost checks the existing BMH `ConsumerRef` against the NetBox owner before cleanup; safe to retry both |
+| External status edit on an OSAC-managed device | A claimed device can look available or an available device can be hidden from allocation | Require pool membership, `staged`, and empty owner for new claims; preserve owner under `If-Match` |
+| Capability schema or filter changes | A query can become invalid or less selective | Refresh field metadata per search, reject incompatible schemas, validate decoded candidates, and coordinate administrator schema edits with allocation |
+| Race between AssignHost and UnassignHost | Device simultaneously assigned and deallocated; inconsistent state | Require the requesting UID to own NetBox and Kubernetes resources; use Kubernetes object preconditions, wait for deletion, then reread owner and conditionally release with `If-Match` |
+| Duplicate/invalid names or rename during allocation | BMH collision or broken fabric lookup | Validate unchanged names and uniqueness before new claims, persist numeric identity before writes, require stable names until drain, and fail closed without adopting foreign resources |
 
 All mitigations are concrete and testable.
 
@@ -684,11 +1024,18 @@ All mitigations are concrete and testable.
 
 **NetBox version floor** — ETag/`If-Match` support makes NetBox 4.6 the minimum for the race-safe implementation. Mitigation: publish the supported point-release matrix and test it in CI.
 
-**Inventory preparation** — Administrators must create the required custom fields and tags, and populate BMC metadata before a device can be allocated. Mitigation: document the exact schema, validate required fields at startup, and provide the Helm/Enclave Wizard input schema.
+**Inventory preparation** — Administrators must create pool, ownership, BMC, and capability fields, and populate device values. Tags require fewer field definitions; custom fields instead provide typed values matching the existing selector contract. Fixed fields are validated at startup and capability fields per search.
+
+**Name contract** — Unchanged device names preserve BCM-style host IDs and
+fabric lookups, but exclude unnamed, invalid, or duplicate-named devices.
+Name-uniqueness checks add read requests. Persisting a separate numeric ID is
+required for safe retries before a BMH exists; renaming requires a drain.
+
+**Schema lookup and query cost** — Each search reads field metadata before querying devices; custom-field filters use NetBox's JSON-backed storage. No query-latency advantage over tags is assumed. Real Community API and large-pool tests establish the baseline before implementation-specific caching or indexing is considered.
 
 **Read-before-write assignment flow** — AssignHost and UnassignHost must read the device before the conditional PATCH to determine its current state and capture an ETag. A concurrent external edit causes the PATCH to fail safely with 412 rather than silently overwriting the device. Mitigation: follow the method-specific race path and retry reconciliation.
 
-**Small custom HTTP adapter** — The official generated Go client is version-coupled and does not provide the per-request concurrency controls required by this design. Mitigation: keep the adapter narrow, test the request/response contract against supported NetBox versions, and avoid duplicating general SDK functionality.
+**Small custom HTTP adapter** — Choosing a hand-maintained adapter instead of the viable generated SDK makes OSAC responsible for its decoding and request policy. Keep its endpoint surface narrow and test both supported Community releases; reassess the SDK if the integration grows.
 
 ## Alternatives (Not Implemented)
 
@@ -736,243 +1083,155 @@ Periodically query NetBox; expose available/claimed host counts in OSAC API for 
 
 **Rejection:** [PRD: Out of Scope — Admin host-listing / inventory visibility in the OSAC API] Deferred to future enhancement. Current design allows future extension without changes to NetBox backend.
 
-## Open Questions
+### Alternative 4: Capability and Pool Tags
 
-### NetBox Version Compatibility
+Pre-create a pool tag and one slug for each capability/value combination.
+Repeated `tag=` filters provide AND matching and allow arbitrary independent
+capability markers without defining a field for each capability dimension. However, exact
+slug keys with placeholder values depart from OSAC's key/value selector;
+encoding pairs into slugs requires a collision-safe naming convention. Tags
+also allow conflicting values for a dimension unless administrators prevent
+them. Separate scalar custom fields provide typed values and direct equality
+filters. Both approaches can narrow results server-side, and no benchmark
+establishes a performance winner. Custom fields are selected for the agreed
+key/value contract. [Locked: D5]
 
-**Question:** Which specific NetBox point releases will be supported?
+### Alternative 5: One JSON Custom Field for All Capabilities
 
-**Owner:** Implementation task; Cloud Infrastructure Admin (testing feedback)
+A generic `osac_labels` map avoids a field definition for every dimension.
+However, arbitrary JSON custom fields do not expose the same scalar `cf_`
+equality filters as separately defined fields in the Community API. A design
+using that map would need a different query mechanism or broader retrieval
+with client-side matching. Separate scalar fields make the query and its
+validation explicit. [Community filter generation](https://github.com/netbox-community/netbox/blob/main/netbox/extras/models/customfields.py)
 
-The race-safe assignment design requires NetBox 4.6 or newer because it relies on the REST API's ETag/`If-Match` support. The initial supported matrix is NetBox 4.6.x and 4.7.x, with exact patch images pinned by CI. The client intentionally limits its dependency surface to device list/detail/partial-update endpoints, tags, device status, and custom fields; it does not depend on unrelated NetBox models or response formats.
+### Alternative 6: Generate BMH Names from Numeric Device IDs
 
-No runtime version endpoint query or version-dependent code paths are needed. The
-client requires the configured NetBox deployment to support ETag/`If-Match`;
-startup can fail if the detail response does not provide the required ETag.
-NetBox also exposes its API version in the `API-Version` response header, which
-can be retained for diagnostics, but the client does not branch on it at
-runtime.
-Any later NetBox release remains unsupported until its pinned compatibility
-image passes the same CI/E2E contract tests and is added to the matrix.
+An ID-derived name avoids NetBox name validity and uniqueness prerequisites
+and embeds the REST lookup key. However, it differs from the inventory/fabric
+hostname and requires explicit translation for hostname-based consumers.
+The selected approach follows the requested BCM-style unchanged name, with
+the numeric ID persisted separately for recovery. [User direction]
 
 ## Test Plan
 
+[The detailed test plan](testplan.md) is the scenario inventory and requirement
+coverage source. The checks below summarize its layers without duplicating
+scenario counts. These are planned acceptance tests, not executed results.
+
 ### Unit Tests
 
-**Configuration Parsing and Validation:**
-- Parse valid YAML config; assert all fields populated correctly
-- Parse config with missing endpoint; assert error
-- Parse config with invalid token Secret reference; assert error
-- TLS certificate loading from Secret; assert correct CA added to http.Client
-- **Resolved HostSelector and tag-key extraction:**
-  - Setup: A `BareMetalInstanceType.spec.host_label_selector.match_labels` map of {"osac-cpu-cores-16": "true", "osac-gpu-model-a100": "true"} is resolved into `spec.selector.hostSelector`
-  - Action: Operator builds the NetBox tag filters from the resolved map
-  - Expected: Fulfillment-service copies the two key/value entries into the CRD without conversion; the NetBox request contains one `tag=` filter for each key (order is not significant), no selector value is encoded, and no hardware field is consulted
-- **Tag-key validation rejects invalid characters:**
-  - Setup: Selector key contains spaces or special characters: {"invalid tag!": "true"}
-  - Action: Operator validates the selector key
-  - Expected: Validation error before any NetBox query; BareMetalInstance status shows error message
+Use Go table-driven tests, a TLS HTTP test server, and mocked Metal3 manager:
 
-**Label Matching → Tag Query Construction (Unit Tests):**
-- Input: {"osac-cpu-cores-16": "any-non-empty-value", "osac-gpu-model-a100": "ignored"}
-  Expected tags (order independent): ["osac-cpu-cores-16", "osac-gpu-model-a100"]
-- Input: {"osac-memory-gb-128": "true"}
-  Expected tags (order independent): ["osac-memory-gb-128"]
-- Input: {"osac-key-with-underscores": "true"}
-  Expected tag (order independent): ["osac-key-with-underscores"] (key is not rewritten)
-- Input: {"osac-gpu-model-a100": "H100"}
-  Expected tags (order independent): ["osac-gpu-model-a100"] (the value is ignored; the key is not rewritten)
-- Input: {"invalid key!": "true"}
-  Expected: validation error (invalid key)
-
-**FindFreeHost Logic:**
-- **Device with matching tags:** Mock NetBox returns device with tags [managed-by-osac, osac-cpu-cores-16]; resolved HostSelector is {osac-cpu-cores-16: true} → device is returned
-- **Device with wrong tags:** Mock NetBox returns empty list (server-side filtering); resolved HostSelector is {osac-gpu-model-v100: true} but no devices have that tag → nil returned
-- **Superset match:** Device has tags [osac-cpu-cores-16, osac-gpu-model-a100, osac-memory-gb-128]; resolved HostSelector is {osac-cpu-cores-16: true} → device IS returned (extra tags are fine)
-- No devices match device selection tag → nil
-- All staged devices returned by NetBox have a non-empty `osac_instance_id` → nil
-- Large result set (100+ devices) → pagination handled correctly
-
-**Capacity Count:**
-- **Test 1 — Count returns correct number:**
-  - Setup: Mock NetBox with 5 devices matching the server-side pool filters (tag=managed-by-osac, status=staged); all have an empty `osac_instance_id`
-  - Action: Paginate the pool query and count devices after the owner check
-  - Expected: Available count is 5
-- **Test 2 — Count updates after assignment:**
-  - Setup: 5 available devices; AssignHost one device
-  - Action: Re-run the paginated capacity query
-  - Expected: "count": 4 (one fewer available)
-- **Test 3 — Count with no available devices:**
-  - Setup: All devices have status=active and osac_instance_id set
-  - Action: Paginate the staged pool query and apply the owner check
-  - Expected: "count": 0
-
-**AssignHost Idempotency:**
-- Assign host → device status becomes active and osac_instance_id is set to the requested ID; returns (host, nil)
-- Assign same host with same ID again → skips ownership PATCH, ensures BMH/Secret idempotently, returns (host, nil)
-- Assign same host with different ID → returns (nil, nil) (race lost)
-- Assign to device that was manually cleared (external edit) → proceeds as normal assign
-- **ETag capture on read:**
-  - Setup: Mock GET returns device with ETag header
-  - Action: AssignHost step 1 reads device
-  - Expected: ETag value is captured and stored for use in step 3 PATCH
-- **If-Match sent on PATCH:**
-  - Setup: AssignHost has captured ETag from step 1
-  - Action: Step 3 sends PATCH
-  - Expected: PATCH request includes If-Match header with the captured ETag value
-
-**UnassignHost Idempotency:**
-- Unassign assigned host → device status is restored to staged and osac_instance_id is cleared; returns nil
-- Unassign same host again → idempotent, returns nil
-- Unassign host with a conflicting BMH consumer reference → returns an ownership-conflict error without cleanup
-- **412 during unassignment:**
-  - Setup: Mock GET returns device assigned to our instance; PATCH returns 412 Precondition Failed
-  - Action: UnassignHost step 4 sends PATCH with If-Match
-  - Expected: UnassignHost re-reads device (back to step 1) and retries; does NOT return error on first 412
-
-**Error Handling:**
-- NetBox API returns 401 → error logged; permanent at the HTTP retry layer; no request-level retry
-- NetBox API returns 5xx → error logged; transient; retry
-- Network timeout → error logged; transient; retry
-- No secrets/credentials in any error message or log
-- **412 Precondition Failed:**
-  - Setup: Mock NetBox PATCH returns 412
-  - Action: AssignHost step 3
-  - Expected: Returns (nil, nil) — treated as race loss, NOT as a transient error (no automatic retry at HTTP level)
-- **412 distinguished from other 4xx:**
-  - Setup: Mock returns 400 Bad Request vs 412
-  - Expected: 400 → permanent error (fail fast); 412 → race loss path (return nil, nil)
-
-**Concurrent Access (ETag-Based):**
-- **Setup:** Mock NetBox returns device with ETag: W/"2026-01-01T00:00:00.000000+00:00"
-- **Test 1 — First writer wins:**
-  - PATCH with If-Match: W/"2026-01-01T00:00:00..." → mock returns 200 OK with new ETag
-  - Expected: AssignHost returns (host, Ready)
-- **Test 2 — Second writer gets 412:**
-  - PATCH with If-Match: W/"2026-01-01T00:00:00..." → mock returns 412 Precondition Failed
-  - Expected: AssignHost returns (nil, nil); does NOT retry the same device; caller retries FindFreeHost
-- **Test 3 — Race sequence:**
-  - Two goroutines both call AssignHost on same device-42
-  - Both capture same ETag from GET
-  - First PATCH succeeds (200); second PATCH gets 412
-  - Assert: exactly one goroutine returns (host, Ready); exactly one returns (nil, nil)
-  - Assert: device-42 has status=active and osac_instance_id set to the winner's ID, not the loser's
-- **Concurrent tag-based FindFreeHost:**
-  - Setup: 3 devices with osac-cpu-cores-16 tag; 2 tenants request the `osac-cpu-cores-16` selector key simultaneously
-  - Action: Both call FindFreeHost with same tag filters
-  - Expected: Both get results from NetBox; AssignHost ETag protection prevents double-allocation; one gets device, other retries or gets different device
+- Decode configuration and fixed field metadata; validate exact field names,
+  supported scalar types, reserved keys, lookup suffixes, and encoded values.
+  Invalid selectors/schema produce errors before listing devices.
+- Translate `{"cpu_cores":"16","gpu_model":"a100"}` into distinct
+  `cf_cpu_cores=16&cf_gpu_model=a100` parameters. Verify unchanged projection
+  separately in fulfillment-service; hardware descriptions supply no filters.
+- Check AND equality and supersets, missing/null values, wrong JSON types,
+  empty ownership, and Boolean pool membership. Paginate past ineligible
+  results and validate pagination URLs without introducing a pool-monitoring
+  query.
+- Exercise conditional assignment/release, missing ETags, conflicting owners,
+  concurrent updates, restart recovery, BMC validation, resource cleanup
+  ordering, and preservation of administrator metadata.
+- Assert generic errors and safe controller logs, bounded retry behavior,
+  TLS rejection, HTTP redirect rejection, and token/BMC secret non-disclosure.
+- Validate unchanged host names, paginated uniqueness checks, independent
+  numeric IDs, rename/missing-device recovery, mounted-file failures, and
+  the NetBox-inventory/Metal3-provisioning startup contract.
 
 ### Integration Tests
 
-These tests use the existing controller-runtime envtest API server and etcd;
-they do not require a full Kind network. The reconciler and an in-process
-TLS-capable `httptest.Server` run in the same Go process, and the NetBox endpoint is set to
-the server's generated URL rather than a fixed `localhost` port.
+BMF controller-runtime envtest tests create BareMetalInstance CRs directly and
+use a TLS NetBox mock. They verify persisted host IDs, later reconciliation,
+same-owner recovery, race loss/reselection, finalizers, Metal3 ownership,
+pending BMH deletion, atomic host-ID/name/device-ID persistence, clearing on
+race loss, persisted compensation/resource-absence checkpoints, completion
+after release followed by reallocation, and Helm-rendered Secret/configuration wiring. Envtest
+simulates Metal3 status; it does not run fulfillment-service or provision a
+physical server.
 
-- Start the mock NetBox server with the required custom-field and device
-  responses
-- Start the envtest operator with NetBox config pointing to the mock server
-- Create a BareMetalInstance whose resolved `spec.selector.hostSelector` contains the test selector
-- Verify FindFreeHost called; host allocated; `spec.externalHostID` set to the deterministic BMH host ID
-- Delete BareMetalInstance; verify UnassignHost called; host deallocated
-- Verify no regressions in other backends by running the existing Metal3 and BCM configurations as separate test deployments; this does not add multi-backend support to one cluster
-- **Concurrent assignment with ETag protection:**
-  - Setup: Two BareMetalInstance CRs requesting same label profile; only one device matches in mock NetBox
-  - Action: Both controllers attempt AssignHost on same device
-  - Expected: Exactly one gets 200; the other gets 412 and retries FindFreeHost; no device is double-assigned
-
-**Failure Recovery:**
-- Simulate a failure creating the BMC Secret or BareMetalHost after the NetBox claim
-- Verify the compensation path removes only the current instance's BMH/Secret and clears the claim; if cleanup cannot be proven safe, the claim remains for retry
-- Simulate NetBox connectivity loss (network partition) during FindFreeHost; observe the normal controller retry after the adapter's request retry budget
-- Simulate permanent auth failure; verify the sanitized error and normal controller backoff
-- Verify `osac_netbox_api_errors_total{error_type="401"}` increments without exposing the token
-
-**Configuration Lifecycle:**
-- Deploy operator with invalid config (bad endpoint); verify startup error
-- Fix the mounted configuration Secret and restart the operator; verify it picks up the new endpoint
-- Drain NetBox-backed instances before switching to another backend; verify no orphaned state
-
-**Tag Update on Device:**
-- Setup: Device has tag osac-memory-gb-64
-- Action: Admin removes osac-memory-gb-64 and adds osac-memory-gb-128; the `BareMetalInstanceType` selector key is updated accordingly
-- Expected: FindFreeHost with key osac-memory-gb-64 no longer returns this device; FindFreeHost with key osac-memory-gb-128 now returns it
-
-**Capacity Metrics Endpoint:**
-- Setup: envtest operator with mock NetBox and 10 staged devices
-- Action: Scrape operator's /metrics endpoint
-- Expected: osac_netbox_hosts_available gauge shows 10; after one assignment, gauge shows 9
-
-**Server-Side Tag Filtering Verification:**
-- Setup: envtest operator with mock NetBox containing 10 devices: 5 have osac-gpu-model-a100, 5 have osac-gpu-model-v100
-- Action: The resolved `spec.selector.hostSelector` contains `{osac-gpu-model-a100: "true"}`
-- Expected: FindFreeHost query includes tag=osac-gpu-model-a100; NetBox returns only the 5 matching devices; operator does NOT receive or filter the V100 devices
-
-**Tag Mismatch — Zero Results:**
-- Setup: Mock NetBox devices have osac-gpu-model-a100
-- Action: The resolved `spec.selector.hostSelector` contains `{osac-gpu-model-h100: "true"}`
-- Expected: FindFreeHost query includes tag=osac-gpu-model-h100; NetBox returns empty list; operator requeues with "No hosts available"
+A separate suite runs against each pinned **NetBox Community** image with
+synthetic devices, field schemas, and credentials. It verifies real scalar
+filter semantics (including case-sensitive equality), ignored/disabled filter
+safety, empty-owner completeness, metadata pagination, schema changes after
+startup, partial-update preservation, and concurrent conditional PATCHes.
+A mock cannot establish those NetBox guarantees. Real API cases also verify
+name filtering, duplicate names across sites/tenants, and recovery by numeric
+ID after a rename.
 
 ### E2E Tests
 
-Tests run against a **pinned real NetBox container** (not mock), exposed
-through a Kubernetes Service rather than `localhost`. Fixtures provision the
-required OSAC custom fields (`osac_instance_id` as a nullable text field with
-exact filtering, BMC metadata, boot MAC), the
-device selection tag (slug `managed-by-osac`), administrator-managed capability tags
-(for example, osac-cpu-cores-16 and osac-gpu-model-a100, matching the
-instance type selector keys), and test devices initially in
-status `staged`.
+Use the monorepo `osac/tests/e2e/bmaas/` pytest patterns and a real Community
+NetBox deployment plus Metal3-accessible hosts. Fixtures contain
+`osac_managed=true`, exact scalar capability fields, BMC metadata, and
+`status=staged`. No pool or capability tags are needed.
 
-**End-to-End Provisioning:**
-- Create a BareMetalInstance whose resolved `spec.selector.hostSelector` matches NetBox devices
-- Observe allocation from NetBox
-- Verify Metal3 BareMetalHost created for power management
-- Monitor provisioning completion (existing BareMetalInstance status workflow)
-- Delete instance; verify host deallocated and returned to pool
-- **Preservation of administrator-managed tags after provisioning:**
-  - OSAC never creates or mutates capability or pool tags; after provisioning, verify the partial PATCH preserved them:
-    - Device in NetBox still has the pre-existing selector tags (for example, osac-cpu-cores-16)
-    - Device has status=active and osac_instance_id set (custom field identifies the owner; status identifies allocation state)
-    - The managed-by-osac tag is still present
+Exercise tenant create/provision/delete, independent tenant claims, restart
+recovery, preservation of pool/capability/unrelated metadata, capacity
+exhaustion and recovery, and concurrent allocation. Measure capacity from
+NetBox before provisioning: BMHs do not exist until assignment. Repeat the
+existing tenant workflow under separate backend configurations to verify API
+transparency. Disconnected coverage uses mirrored dependencies and private
+NetBox connectivity, without public-network access.
 
-**Tenant Transparency:**
-- Create instance against NetBox backend
-- Create instance against Metal3 backend
-- Verify both workflows are identical to tenant (same BareMetalInstance API, same status conditions)
-- No tenant-visible difference in backend choice
-
-**Stress Test:**
-- Rapidly create 20 BareMetalInstance requests simultaneously
-- NetBox has only 10 available hosts matching label tags (server-side filtering)
-- Verify 10 succeed; 10 remain in the existing no-match condition and continue polling
-- Verify no double-allocations in NetBox
-
-**Tag-Based Concurrent Stress:**
-- Setup: 50 devices with osac-cpu-cores-16; 20 tenants requesting the osac-cpu-cores-16 selector key simultaneously
-- Action: All 20 reconcile loops fire concurrently
-- Expected: Exactly 20 devices assigned (one per tenant); 30 remain available; no double-allocations (verified by ETag 412 handling); no orphaned assignments
+Provisioning asserts `HostClass=metal3` and a BMH named exactly like the
+NetBox device. Where fabric networking is configured, test attachment,
+offboarding, and DHCP discovery with both NIC-MAC matching and the existing
+name fallback, including restart with the persisted host binding.
 
 ## Graduation Criteria
 
-The planned 70 scenarios are acceptance criteria, not claims about tests already
-passing:
-
-- **Dev Preview:** all 48 unit and 12 envtest integration scenarios pass; Helm
-  render/install checks pass for NetBox plus Metal3; the ETag race test produces
-  exactly one owner; log tests show no selector values, host IDs, UIDs, or
-  credentials.
-- **Tech Preview:** all 10 E2E scenarios pass against each pinned NetBox image
-  in the 4.6.x/4.7.x matrix; 20 concurrent requests against 10 hosts produce
-  exactly 10 assignments and no orphaned BMH or BMC Secrets.
-- **GA:** all 70 planned scenarios pass across the supported matrix, with no
-  critical allocation or credential-exposure defects, and the administrator
-  setup, operations, and recovery procedures are published in osac-docs.
+- **Dev Preview:** all unit and envtest scenarios in the detailed plan pass;
+  Helm validation passes; races produce one owner and wrong-requester cleanup
+  cannot release another instance; log assertions find no sensitive values.
+- **Tech Preview:** all real Community API and E2E scenarios pass against every
+  pinned supported image. Twenty concurrent requests against ten eligible
+  hosts produce exactly ten assignments and no orphaned BMHs or BMC Secrets.
+- **GA:** the complete plan passes across the supported matrix, with no
+  critical allocation or credential-exposure defects. Administrator setup,
+  migration, operations, and recovery procedures are published in osac-docs.
 
 ## Upgrade / Downgrade Strategy
 
-This is a new backend with no schema migration, but switching away from it has
-an explicit drain requirement. Existing backends remain unchanged.
+The shared OSAC API and CRD schema are unchanged. NetBox preparation and
+selector compatibility still require an explicit migration plan.
+
+**First deployment / existing custom fields:** Reuse compatible fields and
+selector pairs directly. Define missing capability fields and `osac_managed`,
+set exact filtering, and explicitly enroll pool devices with the boolean
+value true. Adding a new capability dimension requires a NetBox field and
+device values; the adapter discovers it without a code change. Do not rename
+existing fields used by other consumers merely to match the examples.
+Validate names and fabric correspondence before enrollment. The device-ID
+annotation and host ID/name are internal controller-owned state, not fields
+the tenant must supply.
+
+**Earlier tag-based prototype:** Pause new allocation and drain existing
+prototype NetBox instances using the old backend before switching contracts.
+Explicitly convert each old capability slug into a field/value pair, and each
+reviewed pool member into `osac_managed=true`; reject ambiguous or conflicting
+tag data. Create new instance-type identities for new requests; retain old
+referenced definitions unchanged until drained. Existing CRD `hostSelector`
+maps are immutable; changing the source catalog entry can cause rejected
+reconciliation patches and is not a migration. Pending resources using old tag
+keys must be cancelled/recreated
+through the normal API lifecycle. Verify cleanup of all persisted host IDs,
+owners, BMHs, and BMC Secrets before enabling the new backend. Unrelated tags
+may stay in NetBox and are ignored by OSAC; no automatic conversion is built
+into the adapter.
+
+The same drain requirement applies to any experimental deployment using
+ID-generated BMH names or lacking the durable numeric-ID annotation. Do not
+rewrite live `ExternalHostID` values or rename existing BMHs in place. This
+design does not infer a missing device binding from a hostname.
+
+**Another inventory backend:** Compatible key/value selectors may be reusable,
+but preserving their shape does not migrate hosts, assignment state, BMC data,
+or backend-specific host IDs. Drain the old backend before changing it, prepare
+the target inventory, and validate selectors against its naming/type rules.
 
 **Downgrade:** Before downgrading to a version without the NetBox backend, stop
 new NetBox allocations, delete or otherwise drain every NetBox-backed
@@ -981,11 +1240,17 @@ OSAC-managed NetBox device still has a non-empty `osac_instance_id`; only then
 switch the Helm values to the alternative backend. If the pool cannot be
 drained, keep the NetBox backend enabled until it can be.
 
-**Version Skew:** Not applicable; NetBox backend is contained within one operator binary. No separate services or versions to coordinate.
+Deploy matching operator and chart revisions together; the runtime options
+and NetBox startup factory must agree with the rendered configuration.
 
 ## Version Skew Strategy
 
-NetBox backend is part of bare-metal-fulfillment-operator; no separate versioning or version skew concerns. Operator and backend version in lockstep.
+The NetBox client and its internal interface/controller changes ship in one
+BMF binary. Its chart must render file-path options, the device-name identity
+contract, and Metal3 management as described here. Existing AAP Metal3 and
+hostname consumers are reused; their behavior is covered by E2E tests.
+Do not mix prototype and revised NetBox operators against live instances;
+drain before switching identity/configuration contracts.
 
 If future out-of-tree migration (OSAC-3806) separates backend into sidecar, version skew strategy will be defined then. Current design supports clean extraction (backend implements `inventory.Client`; no operator-internal types leaked).
 
@@ -1009,7 +1274,8 @@ If future out-of-tree migration (OSAC-3806) separates backend into sidecar, vers
 **Symptoms of schema mismatch:**
 - Operator startup logs: "Custom field osac_instance_id not found in NetBox"
 - Operator exits or marks itself unhealthy
-- FindFreeHost returns zero devices when devices exist: verify the exact tag slugs used as the BareMetalInstanceType selector keys are applied to devices in NetBox. OSAC does not generate or rewrite capability tags.
+- Capability-schema errors fail the affected allocation attempt before querying devices; verify field names, supported scalar types, device association, and exact filtering
+- A valid FindFreeHost query with zero candidates: verify `osac_managed=true`, `staged`, empty owner, and the requested capability values on devices
 
 ### Disable the Feature
 
@@ -1021,8 +1287,8 @@ To disable NetBox backend and switch to Metal3:
    `osac_instance_id`.
 3. Update Helm values: disable `bmf.netbox` and enable the desired alternative
    backend (for example, `bmf.metal3`).
-4. Run `helm upgrade osac ./charts/osac -f values.yaml`; the operator restarts
-   and picks up the new backend configuration.
+4. Run `helm upgrade osac ./charts/osac -f values.yaml`, then explicitly
+   restart the BMF Deployment to load the new backend configuration.
 
 If the pool cannot be drained, do not disable NetBox: the configured backend is
 also used for cleanup, so switching first can orphan NetBox assignments.
@@ -1039,10 +1305,11 @@ Secrets orphaned.
 
 To re-enable NetBox backend after disabling:
 
-1. Verify NetBox status/custom-field conventions are intact (`staged` for available, `active` plus `osac_instance_id` for claimed); verify administrator-managed capability tags are applied to devices
-2. Ensure API token Secret is present and valid
-3. Update Helm values back to `bmf.netbox.enabled: true` and `bmf.metal3.enabled: true`
-4. Helm upgrade; operator restarts
+1. Verify NetBox status/custom-field conventions are intact (`staged` for available, `active` plus `osac_instance_id` for claimed); verify `osac_managed=true` and administrator-maintained capability field values on pool devices
+2. Supply valid token/CA input files and the intended Metal3 namespace
+3. Set `bmf.netbox.enabled: true` and disable conflicting inventory backends;
+   Metal3 management is included automatically
+4. Helm upgrade, then explicitly restart the BMF Deployment
 5. New allocations use NetBox again. Recreate or resubmit any drained
    BareMetalInstance resources after the backend is enabled.
 
@@ -1060,3 +1327,14 @@ Testing infrastructure:
 - In-process TLS `httptest.Server` for unit and envtest integration tests
 - A pinned NetBox container exposed through a Kubernetes Service for full Kind
   E2E tests
+
+---
+
+## Provenance
+
+Authored: revise @ design 0.11.3 - 9b25062, workspace feat/OSAC-4742-netbox-tags-etag-design @ f0a8211
+Phases: revise, revise, revise
+
+> This document's phase history does not include an initial /draft — structure was not verified against the template from origin.
+
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.3","ai_workflows":"9b25062","source_repo":"f0a8211","source_repo_branch":"feat/OSAC-4742-netbox-tags-etag-design","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["revise","revise","revise"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":true} -->
