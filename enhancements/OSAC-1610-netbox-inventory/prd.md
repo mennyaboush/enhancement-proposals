@@ -17,6 +17,7 @@ A sovereign-cloud operator runs NetBox as their authoritative source of truth fo
 - Invalid credentials result in clear error messages without exposing the credential value.
 - NetBox authentication uses API token stored as a Secret resource for secure credential management.
 - NetBox communication requires HTTPS with certificate validation; self-signed certificates are supported via optional CA certificate configuration.
+- Cloud Infrastructure Admin can configure secure BMC access through OSAC Secret Management without storing raw BMC credentials in NetBox.
 - BareMetalInstance provisioning and deprovisioning completes end-to-end against NetBox inventory, with accurate status messages at each stage.
 - When host preparation fails, the host is released back to NetBox's available pool.
 - Tenant Users can request bare-metal hosts by the existing resolved capability selector and OSAC transparently allocates them from NetBox without exposing NetBox details to the user.
@@ -69,11 +70,13 @@ A sovereign-cloud operator runs NetBox as their authoritative source of truth fo
 - Administrators pre-create and populate separate scalar capability custom fields on NetBox devices. Instance-type selectors use the same field names and meaningful values; OSAC does not create field definitions or rewrite inventory capabilities.
 - NetBox API is reachable from the OSAC control plane.
 - OSAC tracks host assignments in NetBox with the `osac_instance_id` custom field; `status=staged` and an empty owner identify an available device, while `status=active` and a non-empty owner identify a claimed device. Administrator-managed boolean `osac_managed=true` scopes the OSAC pool. No tags are required for selection.
+- BMC credentials are managed through OSAC Secret Management and are not part of the NetBox inventory data.
 - The backend uses NetBox Community's open-source APIs and requires no Enterprise features or paid plugins.
 
 ## Dependencies
 
 - **Pluggable inventory backend system (OSAC-1032)** — the platform's ability to select different inventory backends (NetBox, OpenStack, Metal3, etc.) at deployment time.
+- **OSAC Secret Management (OSAC-1567)** — provides secure management of BMC credentials.
 - **Host readiness and power management** — independent of inventory selection; existing platform mechanisms are used.
 - **Host-selector contract** — NetBox preserves the existing key/value meaning: resolved keys name custom fields and values express equality. Existing selectors can be reused when their keys and values meet the NetBox field contract; incompatible names or types require administrator preparation, not automatic conversion. The existing OSAC API field names remain unchanged.
 - **BareMetalInstance API** — tenant-facing API remains unchanged; NetBox integration is transparent to users.
