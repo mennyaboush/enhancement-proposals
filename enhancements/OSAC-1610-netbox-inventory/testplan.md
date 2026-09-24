@@ -28,9 +28,17 @@ fixtures unless a scenario explicitly changes them:
 |-------|------------------------|----------------|
 | `osac_managed` | Optional Boolean (`required=false`), default `false`, exact filtering; eligible devices explicitly set JSON `true` | Cloud Infrastructure Admin controls pool membership |
 | `osac_instance_id` | Optional text, no nonempty default, exact filtering; missing, `null`, or `""` denotes no owner | OSAC claims and clears the owner |
-| `osac_bmc_username`, `osac_bmc_password`, `osac_bmc_address`, `osac_boot_mac` | Pre-created text fields with valid synthetic BMC/boot data | Administrator supplies metadata; OSAC reads it |
+| `osac_bmc_address`, `osac_boot_mac` | Pre-created text fields containing valid BMC and boot data | Provider/platform admin supplies the connection metadata |
 | `cpu_cores`, `memory_gb` | Integer, exact filtering; JSON `16`, `128` | Administrator supplies capabilities |
 | `gpu_model` | Text, exact filtering; `"a100"` | Administrator supplies capabilities |
+
+For every fixture device, provider setup also creates a system-scoped OSAC
+Secret through the Secret API with the BMC username/password and the label
+`osac.openshift.io/netbox-device-<device-id>: "true"`. A single Secret may
+carry labels for multiple fixture devices. Tests use redacted Secret API
+fixtures; credentials never appear in NetBox fixtures, request logs, or
+assertions. The adapter lists Secrets by the constructed device-label key and
+requires exactly one match.
 
 Initial projection copies `{"cpu_cores":"16","gpu_model":"a100",
 "memory_gb":"128"}` unchanged into the immutable BMI selector. The current
@@ -96,7 +104,6 @@ custom-field selectors, writes, or deletion requests.
 |---------------|---------------------|
 | `InstanceID` | BMI Kubernetes UID, e.g. `inst-123`; never a catalog ID or a label-derived identity |
 | `InstanceName`, `InstanceNamespace` | Current requesting BMI's Kubernetes name/namespace |
-| `BackendID` | Numeric NetBox device ID from the controller-owned `osac.openshift.io/inventory-device-id` annotation, never parsed from the hostname or supplied by assignment labels |
 | `CleanupState` | Controller-owned `osac.openshift.io/inventory-cleanup`; empty for assignment, `releasing` or `compensating` before cleanup, and the corresponding `*-ready` after resource absence is persisted |
 | `HostSelector` | Snapshot copied from the persisted BMI spec; distinct from assignment labels |
 | `ResourceAnnotations` | Controller copies trusted BMI `osac.openshift.io/tenant` and derives `osac.openshift.io/owner-reference` from the BMI Kubernetes UID |
@@ -146,37 +153,46 @@ a failed read or inconsistent state returns an error preserving ExternalHostID.
 This GET resolves a failed PATCH's ownership outcome, including a delayed
 earlier commit; it is not redundant verification of a successful PATCH.
 
-### Device Names and Durable Identity
+### Device ID and Durable Identity
 
-Default fixtures use NetBox ID `1`, name `worker-01`, and BMH namespace
-`baremetal`: host ID `baremetal/worker-01`, host name `worker-01`, numeric
-`BackendID="1"`, and BMC Secret `worker-01-bmc-secret`. Other devices use
-distinct valid names unless testing collisions. Device names are not IDs.
+Default fixtures use NetBox device ID `42` and BMH namespace `baremetal`. The
+device name may be `worker-01`, empty, or null; it does not affect the mapping:
 
-`FindFreeHost` validates unchanged names against BCM's 1–63-character
-lowercase letter/digit/hyphen contract with alphanumeric ends, then performs
-a paginated `name=<exact name>` query without capability/availability filters.
-NetBox's name filter is case-insensitive: reject case-equivalent duplicates,
-then require the sole decoded name and ID to match the candidate exactly.
-Exactly one such device must exist in the token-visible inventory;
-repeat before a new claim. These extra requests validate identity and never
-select a different host or replace custom-field matching.
+| Field | Expected value |
+|---|---|
+| `Host.InventoryHostID` / BMI `spec.externalHostID` | `baremetal/netbox-42` |
+| `Host.Name` / BMH `metadata.name` | `netbox-42` |
+| BMI `spec.externalHostName` | empty/unset |
+| BMC Secret | `netbox-42-bmc-secret` |
+| NetBox REST path | `/api/dcim/devices/42/` |
 
-The NetBox controller path persists ExternalHostID, ExternalHostName, and the
-numeric-ID annotation together before calling AssignHost. Require all three
-and a positive canonical decimal int64 ID; the saved name must equal the host
-ID suffix in the configured namespace. Preserve the binding on errors and
-uncertain writes, and clear all three atomically only for confirmed reselection.
-All detail/claim/release requests use the saved numeric ID. A name change blocks
-assignment without a new BMH; owner-checked release still uses the original
-numeric ID and saved BMH name. A deleted device (404) retains the binding and
-finalizer for repair, never falling back to a same-named replacement.
+The `netbox-` prefix is alphabetic and the result is validated with the
+centralized Kubernetes `IsDNS1035Label` helper. The final name is lowercase,
+uses only letters/digits/hyphens, starts with a letter, and ends with a letter
+or digit. Positive canonical decimal IDs are required; zero, negative,
+leading-zero, nonnumeric, and overflowing values fail before any claim or
+Kubernetes write. The positive int64 range keeps the result below 63
+characters.
+
+The adapter does not query, normalize, or validate `device.name`, site, or
+region for identity. NetBox IDs are unique within the configured endpoint, so
+no full-inventory name scan or duplicate-name rejection is needed. A foreign
+BMH or Secret with the derived name is never adopted. A change to `device.name`
+does not change the host identity; a 404 for device `42` retains the binding
+and finalizer and never falls back to a replacement device with the old name.
+
+The controller persists only `externalHostID` before calling `AssignHost`. It
+does not persist `BackendID`, `osac.openshift.io/inventory-device-id`, or
+`externalHostName` for this backend. All detail/claim/release requests parse
+the numeric ID from the saved ID-derived host name; errors and uncertain writes
+retain that binding, while confirmed reselection clears it.
 
 NetBox inventory returns `HostClass=metal3`; the existing provisioning role
-uses ExternalHostID for BMH lookup. Hostname-based networking uses the saved
-ExternalHostName or the identical host-ID suffix. Provider fabric entries must
-use that name; no rename is allowed during a pending/active allocation.
-DHCP keeps the existing MAC-first behavior and name fallback when MAC is absent.
+uses the namespace-qualified `externalHostID` for BMH lookup. Both AAP network
+playbooks use the same ID-derived name because `externalHostName` is empty and
+their existing fallback takes the final segment of `externalHostID`. A
+hostname-based fabric must register `netbox-42`; DHCP still prefers the
+inspected NIC MAC and uses this value only for its existing name fallback.
 
 ## Testing Infrastructure & Patterns
 
@@ -305,8 +321,9 @@ client. No external dependencies.
 - **Expected:** Token loaded; not exposed in logs or error messages
 - **Negative variants:** Missing path, nonexistent/unreadable file, and empty
   token fail initialization before any authenticated request. A plain Secret
-  name is not resolved through Kubernetes. Assert zero Secret API requests
-  during token loading; per-host BMC Secret operations remain separate.
+  name is not resolved through Kubernetes. Assert zero Kubernetes Secret API
+  requests during token loading; OSAC BMC credential resolution remains a
+  separate assignment-time operation.
 
 #### TC-UNIT-004: Load CA Certificate from Optional Mounted File
 
@@ -323,7 +340,8 @@ client. No external dependencies.
   fields. Vary `osac_managed` to missing, required, text type, default `true`, wrong
   model, disabled filtering, or loose filtering; vary `osac_instance_id` to
   missing, required, nonempty default, non-text, wrong model, or non-exact filtering. Also omit
-  or give a wrong type to each required BMC/boot metadata field in turn;
+  or give a wrong type to each required BMC address/boot-MAC
+  field in turn;
   for each fixed field test present non-active status. The compatible 4.6.10
   metadata variant has no status attribute; 4.7.1 reports active status.
 - **Action:** Initialize the client against each fixture using
@@ -331,7 +349,8 @@ client. No external dependencies.
 - **Expected:** Only the compatible fixed schema permits startup. Otherwise
   initialization returns a configuration error naming the field and expected
   schema without listing devices or changing NetBox. No capability whitelist
-  is required at startup; BMC fields need no capability-filter policy.
+  is required at startup; BMC address/boot-MAC fields need no
+  capability-filter policy.
 
 #### TC-UNIT-006: TLS Validation Failure on Invalid Certificate
 
@@ -544,7 +563,7 @@ client. No external dependencies.
 #### TC-UNIT-027: Reject Reserved Names and Lookup Injection
 
 - **Setup:** Parameterize keys `osac_managed`, `osac_instance_id`,
-  `osac_bmc_username`, `osac_bmc_password`, `osac_bmc_address`, `osac_boot_mac`,
+  `osac_bmc_address`, `osac_boot_mac`,
   `cf_cpu_cores`, `cf_osac_managed`, `gpu_model__ic`, `cpu_cores__gte`,
   `x__y`, and `osac_instance_id__empty`.
 - **Action:** Validate each selector before building a query.
@@ -679,9 +698,9 @@ client. No external dependencies.
 - **Action:** AssignHost, retry with the same owner, then UnassignHost;
   inject a concurrent administrator capability edit causing a release 412.
 - **Expected:** Only status and owner change. PATCH sends only `status` and
-  `custom_fields.osac_instance_id`; it never echoes BMC credentials or other
-  custom fields. NetBox's merge retains pool, capabilities, BMC metadata,
-  unrelated values, and tags.
+  `custom_fields.osac_instance_id`; it never echoes BMC credential values,
+  Secret labels, or other custom fields. NetBox's merge retains pool,
+  capabilities, BMC address/boot-MAC metadata, unrelated values, and tags.
   Retrying after 412 re-reads and preserves the administrator's latest edit.
   No schema mutation or capability/pool-value update is issued by OSAC.
 
@@ -727,14 +746,14 @@ client. No external dependencies.
   2. Create a separate catalog type B with different keys/values, then
      reconcile the existing A-based BMI through CreateOrPatch again,
      including a reconciler restart. Before that reconcile, seed the
-     operator-owned host ID/name, numeric device-ID annotation, and cleanup
-     checkpoint annotation on the CR; verify all survive repeated projection.
+     operator-owned namespace-qualified host ID and cleanup checkpoint
+     annotation on the CR; verify all survive repeated projection.
   3. Create a new BMI referencing B and inspect its selector.
 - **Expected:** Initial projection preserves all exact keys and meaningful
   values. Under the unchanged-source prerequisite, the existing BMI retains
   its original map without merging B's selector; the new BMI uses B's map.
-  Tenant metadata and all three operator-owned identity binding values remain
-  intact; source projection does not clear or rewrite them. Assert
+  Tenant metadata and the operator-owned host binding remain intact; source
+  projection does not clear or rewrite them. Assert
   intended write payloads explicitly: the fake client alone does not enforce
   CRD immutability. Editing/removing/recreating A or the referenced legacy
   template is unsupported because current reconciliation re-resolves it;
@@ -752,7 +771,7 @@ client. No external dependencies.
 - **Expected:** Selection uses both requested capabilities and fixed
   pool/status/owner predicates. Only the matching device is returned; no
   separate pool-wide counting request or background availability refresh occurs.
-  The candidate's exact-name uniqueness query is permitted, but cannot choose
+  Host-name derivation is local to the selected device ID and cannot choose
   another device or broaden capability matching.
 
 #### TC-UNIT-032: Next Search Excludes the Newly Claimed Candidate
@@ -823,7 +842,7 @@ client. No external dependencies.
   passed to AssignHost/UnassignHost, and mutate the original maps after capture.
   Run the existing backend contract suites with the extended interface.
 - **Expected:** Context contains exactly the requesting BMI identity,
-  independent selector snapshot, saved numeric BackendID, trusted tenant annotation, and owner-reference
+  independent selector snapshot, trusted tenant annotation, and owner-reference
   derived from the BMI UID even if its input owner annotation is absent or
   conflicting. Assign labels and
   release label names remain separate; they cannot override context identity
@@ -855,12 +874,17 @@ client. No external dependencies.
 #### TC-UNIT-038: Successful Assignment
 
 - **Setup:** Device found unassigned; AssignHost called with instanceID "inst-123"
-- **Action:** AssignHost with `inventoryHostID="baremetal/worker-01"`,
-  `AllocationContext.BackendID="1"`, and `InstanceID="inst-123"`
+- **Action:** AssignHost with `inventoryHostID="baremetal/netbox-42"` and
+  `InstanceID="inst-123"`
 - **Expected:** Device PATCH sets status=active and osac_instance_id to "inst-123"; returns (host, nil)
-- **Validation variants:** Omit each BMC/boot custom-field value or provide
-  an invalid BMC address/MAC. Assignment returns a validation error before
-  the claim PATCH or Kubernetes creates; all pool/capability values survive.
+- **Validation variants:** Omit the address or boot MAC; return no matching,
+  multiple matching, or malformed system-scoped OSAC Secret; or provide an
+  invalid BMC address/MAC. Deterministic validation fails before the claim
+  PATCH or Kubernetes creates, records a sanitized failure for a staged,
+  unowned device, and preserves all pool/capability values. Secret API outage
+  or access/configuration failure is retryable, leaves NetBox status unchanged,
+  and creates no resources. A valid device label resolves username/password
+  only in memory and supplies them to the runtime Secret manager.
 
 #### TC-UNIT-039: Idempotent Retry — Same Assignment ID
 
@@ -901,10 +925,11 @@ client. No external dependencies.
   PATCH commit before the new PATCH, causing the new PATCH to receive 412.
   Its follow-up GET observes active/same UID: retain the pointer and resume
   BMH/Secret ensures, with one committed claim and no reselection or orphaned
-  assignment. Change BMC metadata before that follow-up GET and assert the
-  adapter extracts and validates the newly read values, not the stale
-  pre-PATCH values; invalid metadata prevents resource creation and retains
-  the existing claim for repair. If that ownership GET fails or returns inconsistent state,
+  assignment. Change the device's Secret label association or connection
+  metadata before that follow-up GET and assert the adapter resolves and
+  validates the newly read values, not the stale pre-PATCH values; an invalid
+  or ambiguous source Secret or metadata prevents resource creation and
+  retains the existing claim for repair. If that ownership GET fails or returns inconsistent state,
   return an error and retain the pointer for the next reconciliation.
 
 #### TC-UNIT-042: ETag Capture on Read
@@ -996,61 +1021,59 @@ client. No external dependencies.
 #### TC-UNIT-048: GetHostNICs Delegates to BMH Hardware Data
 
 - **Setup:** Existing BMH has inspected hardware with NIC MAC addresses
-- **Action:** GetHostNICs(inventoryHostID="baremetal/worker-01")
+- **Action:** GetHostNICs(inventoryHostID="baremetal/netbox-42")
 - **Expected:** Lowercased MAC addresses are returned as `inventory.HostNIC` values; no NetBox API call is made
 - **Note:** If the BMH has no hardware data yet, return `(nil, nil)` following the existing BCM manager contract
 
-### Device Naming and Recovery Binding
+### Device ID and Recovery Binding
 
-#### TC-UNIT-062: Preserve Valid Names and Reject Ambiguous Candidates
+#### TC-UNIT-062: Generate Kubernetes-Safe ID-Derived Names
 
-- **Setup:** Candidate ID `42`, name `worker-rack3-07`; exact-name lookup
-  returns that device. Parameterize empty/null names, uppercase, spaces,
-  underscores, dots, slashes, leading/trailing hyphens, and 64 characters;
-  positive boundaries include one character and 63 characters. Add duplicate
-  exact names with different IDs/sites/tenants, including on a later page and
-  on an unavailable device, a case-equivalent `Worker-Rack3-07`, plus
-  broader-response decoys with other names.
-- **Action:** FindFreeHost; repeat the uniqueness check before a new AssignHost
-  claim. Decode the URL and inspect all returned Host fields.
-- **Expected:** Valid unique input returns `baremetal/worker-rack3-07`,
-  `Name=worker-rack3-07`, `BackendID="42"`, and `HostClass=metal3` without
-  rewriting names. Exact-name requests contain no pool/status/capability
-  narrowing. Zero matching names, a different numeric ID, duplicates, or an
-  invalid name produce an identity/configuration error before any claim or
-  Kubernetes write. An interrupted pagination read also fails closed.
-  Custom-field selection still determines which device is a candidate.
+- **Setup:** Candidate device ID `42`; parameterize `device.name` as
+  `worker-rack3-07`, empty, null, duplicate, uppercase, whitespace, or other
+  invalid text. Include a positive one-digit ID, the largest supported
+  positive int64 ID, zero, negative, leading-zero, nonnumeric, overflowing,
+  and otherwise malformed IDs.
+- **Action:** FindFreeHost and inspect the returned Host and request path.
+- **Expected:** Every valid device-name variant returns
+  `baremetal/netbox-42`, `Name=netbox-42`, an empty `ExternalHostName`, and
+  `HostClass=metal3`; the detail path is `/api/dcim/devices/42/`. The
+  centralized `IsDNS1035Label` helper accepts the `netbox-<id>` result before
+  any claim or Kubernetes write. Invalid IDs return an identity/configuration
+  error. Device name, site, region, and unrelated duplicate names do not
+  change the result or trigger a full-inventory identity scan; capability
+  matching still determines candidates.
 
-#### TC-UNIT-063: Use Persisted Numeric Identity Independently of Hostname
+#### TC-UNIT-063: Use Persisted Namespace-Qualified ID Identity
 
-- **Setup:** Complete binding for `baremetal/worker-01`, host name `worker-01`,
-  and numeric ID `42`. Deliberately ensure the hostname's digits do not match
-  the ID. Parameterize missing ID, zero, negative, leading-zero, nonnumeric,
-  overflowing int64, wrong namespace, and mismatched saved host name.
+- **Setup:** Complete binding `baremetal/netbox-42`; configure Metal3
+  namespace `baremetal`. Parameterize wrong namespace, missing slash, wrong
+  prefix, zero/negative/noncanonical/overflowing ID, mismatched BMH name, and
+  a conflicting assignment label that contains another ID.
 - **Action:** Invoke controller allocation/release and adapter methods with
-  each binding; assignment labels include a conflicting numeric ID. Recreate
-  the client between calls and do not create a BMH before the claim read.
-- **Expected:** The valid path reads/PATCHes `/api/dcim/devices/42/` and manages
-  BMH `worker-01`, never device `1`. Context uses the persisted annotation,
-  not labels, name parsing, or an in-memory cache. Invalid/partial bindings
-  return an identity error before NetBox writes or BMH/Secret mutations;
-  they are retained for repair rather than inferred or silently replaced.
+  each binding. Recreate the client between calls and do not create a BMH
+  before the claim read.
+- **Expected:** The valid path reads/PATCHes `/api/dcim/devices/42/` and
+  manages BMH `baremetal/netbox-42`; it never uses an ID from labels,
+  `device.name`, a BMH lookup, or an in-memory cache. The namespace must match
+  the configured Metal3 namespace. Invalid or partial bindings return an
+  identity error before NetBox writes or BMH/Secret mutations and remain for
+  repair rather than being inferred or replaced.
 
-#### TC-UNIT-064: Rename or Replacement Cannot Redirect Recovery
+#### TC-UNIT-064: Device Name Changes Cannot Redirect Recovery
 
-- **Setup:** Persisted binding to ID `42`, `worker-01`; parameterize a rename
-  to `worker-renamed` before claim, after same-owner claim, and during release.
-  Separately return 404 for ID `42` while ID `99` now uses `worker-01`.
-- **Action:** Restart the client and call AssignHost/UnassignHost. For release,
-  use same-UID owned BMH/Secret named from the persisted binding, then repeat
-  with a foreign requesting UID. Also rename between the eligibility GET and
-  claim PATCH, causing 412; the recovery GET must revalidate the bound name
-  before deciding to resume preparation or reselect.
-- **Expected:** Renamed assignment fails without a new BMH, reselection, or
-  claim write; existing binding/claim remain. Authorized release uses only
-  device `42` and the saved BMH/Secret names, even after rename or pool removal.
-  A 404 retains the binding/finalizer with no destructive cleanup or name
-  fallback. Device `99` and foreign-owner resources are never touched.
+- **Setup:** Persisted binding `baremetal/netbox-42` and BMH/Secret
+  `netbox-42`. Parameterize a raw rename, empty-to-name transition,
+  name-to-empty transition, site/region change, and a 404 for ID `42` while ID
+  `99` reuses the old device name.
+- **Action:** Restart the client and call AssignHost/UnassignHost. Repeat with
+  a foreign requesting UID and with a 412 between the eligibility GET and claim
+  PATCH.
+- **Expected:** Name, site, and region changes do not alter the ID-derived
+  BMH or cause reselection; the same-owner path continues using device `42`.
+  Authorized release uses only device `42` and `netbox-42`. A 404 retains the
+  binding/finalizer with no destructive cleanup or name fallback. Device `99`
+  and foreign-owner resources are never touched.
 
 #### TC-UNIT-065: Cleanup Intent and Absence Checkpoints Gate Side Effects
 
@@ -1096,6 +1119,10 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
   **mock NetBox HTTPS server** (`httptest.NewTLSServer`); Kubernetes Secret with API token
 - **Prerequisites:**
   - Fixed integration and capability fields use the shared schema
+  - Mock system-scoped OSAC Secret(s) contain the synthetic username/password
+    and label each associated device with
+    `osac.openshift.io/netbox-device-<device-id>: "true"`; at least one Secret
+    is labeled for multiple devices to verify supported reuse
   - 5 devices have `status=staged`, `osac_managed=true`, empty owner, and
     matching typed capability values
 - **Action:**
@@ -1105,17 +1132,19 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
      exercised by TC-E2E-003
   2. Wait for operator to reconcile
 - **Expected:**
-  1. BareMetalInstance `spec.externalHostID` is `<metal3 namespace>/<device.name>`;
-     `spec.externalHostName` is the unchanged device name, and its numeric-ID
-     annotation is persisted in the same update before claiming NetBox
+  1. BareMetalInstance `spec.externalHostID` is
+     `<metal3 namespace>/netbox-<id>`; `spec.externalHostName` remains empty,
+     and no numeric-ID annotation is persisted before claiming NetBox
   2. Device in NetBox now has status=active and osac_instance_id set to BareMetalInstance UID
   3. No device is double-allocated; this is checked from the NetBox fixture
      state rather than from a Kubernetes Event
-  4. BMC metadata reaches the deterministic operator-managed Secret and BMH
-     consumer reference; pool, capabilities, unrelated custom fields, and
-     tags are unchanged
-  5. The BMH name equals the device name, its Secret has the documented suffix,
-     and the ready host's BMI `hostClass` is `metal3`, not `netbox`
+  4. The device label resolves exactly one system-scoped Secret through the
+     OSAC Secret API, and its values reach only the deterministic
+     operator-managed runtime Secret and BMH consumer reference; pool,
+     capabilities, unrelated custom fields, and tags are unchanged
+  5. The BMH name equals `netbox-<id>` in the configured Metal3 namespace,
+     its Secret has the documented suffix, and the ready host's
+     BMI `hostClass` is `metal3`, not `netbox`
 
 #### TC-INT-002: Deallocate Host via BareMetalInstance Deletion
 
@@ -1132,8 +1161,9 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
 
 #### TC-INT-003: Host Preparation Failure Rolls Back the Claim
 
-- **Setup:** BareMetalInstance has claimed a staged device; the mock BMC Secret
-  or BareMetalHost creation fails after the NetBox assignment PATCH
+- **Setup:** BareMetalInstance has claimed a staged device; the mock OSAC
+  Secret resolution/runtime BMC Secret or BareMetalHost creation fails after
+  the NetBox assignment PATCH
 - **Action:**
   1. Reconcile the BareMetalInstance
   2. Persist compensation intent, then allow cleanup to run; restart after
@@ -1196,7 +1226,8 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
 - **Setup:** Drain all pending/allocated NetBox BMIs and verify cleanup, then
   update Helm values from one endpoint to a new endpoint with prepared inventory
 - **Action:**
-  1. Update the mounted inventory configuration Secret with the new endpoint URL
+  1. Run a Helm upgrade with the new endpoint value using the protected
+     values mechanism; do not patch the mounted Secret directly
   2. Restart operator
   3. Create BareMetalInstance
 - **Expected:**
@@ -1418,10 +1449,12 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
   `osac/bare-metal-fulfillment-operator/charts/operator/` and
   `osac/osac-installer/charts/osac/`; use their existing `make helm-lint`
   conventions and the monorepo Kind installation harness for the install phase.
-- **Setup:** Synthetic token/CA files, the canonical `bmf.netbox`, `bmf.metal3`,
-  and `bmf.secrets` values; enable `global.services.bmaas.enabled`. Supply the
-  umbrella schema's required nonempty service hostnames. Prepare a Kind
-  cluster with Metal3 and a private TLS NetBox test endpoint with valid schema.
+- **Setup:** Synthetic token/CA files and the canonical `bmf.netbox` and
+  `bmf.metal3` values; rely on the chart's default Secret names unless the
+  override case is being tested. Enable `global.services.bmaas.enabled`.
+  Supply the umbrella schema's required nonempty service hostnames. Prepare a
+  Kind cluster with Metal3 and a private TLS NetBox test endpoint with valid
+  schema.
 - **Action:**
   1. Run `helm lint` and `helm template` for the subchart and umbrella chart
      using protected file inputs and freshly rebuilt BMF chart dependencies.
@@ -1438,8 +1471,10 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
      initialization, allocate/delete one test BMI, then rotate the token through
      Helm and restart the operator as documented. Deny access from the render
      process to NetBox; runtime operator access remains on the private network.
-- **Expected:** NetBox enablement alone produces exactly one inventory Secret
-  (`type=netbox`, `hostClass=metal3`) and one management Secret (`type=metal3`).
+- **Expected:** NetBox enablement alone produces exactly one inventory-config
+  Secret (`type=netbox`, `hostClass=metal3`) and one management-config
+  Secret (`type=metal3`). The separately named token Secret and optional CA
+  Secret are also present when configured.
   A true Metal3 inventory flag together with NetBox fails rendering, as do
   BCM and fake-backend conflicts; exactly one inventory can be selected.
   Helm creates the named token Secret/key `token` and optional CA/key `ca.crt`,
@@ -1464,7 +1499,7 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
 #### TC-INT-028: Persist and Clear the Complete Host Binding Atomically
 
 - **Location:** Extend the BMF envtest/controller patterns used by TC-INT-024.
-- **Setup:** Candidate ID `42`, name `worker-01`, matching capabilities, and
+- **Setup:** Candidate ID `42`, matching capabilities, and
   no BMH/Secret. Watch BMI updates and record NetBox writes. Inject a failed
   or resourceVersion-conflicting BMI update at candidate persistence.
 - **Action:**
@@ -1475,14 +1510,15 @@ and `baremetalinstance_metal3_integration_test.go`) for envtest setup,
   4. Separately arrange a confirmed other-owner race and observe reselection;
      also inject an uncertain PATCH and an invalid partial binding.
 - **Expected:** No claim or per-host Kubernetes write precedes successful
-  persistence of `externalHostID=baremetal/worker-01`,
-  `externalHostName=worker-01`, and device-ID annotation `42` in one update.
-  Restart supplies `BackendID=42` without a BMH/cache/name lookup for recovery;
+  persistence of
+  `externalHostID=baremetal/netbox-42` in one update; `externalHostName`
+  remains empty and no device-ID annotation is written. Restart parses `42`
+  from the saved host ID without a BMH/cache/name lookup for recovery;
   same-owner retry creates at most the one correctly named BMH/Secret pair.
-  Ready assignment sets `hostClass=metal3`. Confirmed reselection clears all
-  three binding values together; errors and uncertain writes retain them.
-  Partial binding blocks mutation/reselection. Normal finalizer cleanup uses
-  the saved binding until complete. Other backends need no BackendID annotation.
+  Ready assignment sets `hostClass=metal3`. Confirmed reselection clears the
+  host binding; errors and uncertain writes retain it. Partial binding blocks
+  mutation/reselection. Normal finalizer cleanup uses the saved binding until
+  complete.
 
 ### Real NetBox Community API Semantics
 
@@ -1492,27 +1528,26 @@ other cases, use bounded polling, and clean up fields/devices/claims created
 by each test. Every case runs against both Community 4.6.10 and 4.7.1; a missing
 capability such as `If-Match` must fail compatibility, not skip the assertion.
 
-#### TC-INT-029: Community Name Uniqueness and Numeric-ID Recovery
+#### TC-INT-029: Community ID Identity and Numeric-ID Recovery
 
-- **Setup:** Real devices named `worker-01` in distinct sites/tenants, which
-  NetBox permits. Only one meets the capability/status filters; both are visible
-  to the runtime token. Include a similarly named `worker-010` decoy and a
-  separate case-equivalent `Worker-01` collision variant in another site.
+- **Setup:** Real devices with ID `42` and IDs `43`/`99`, including named,
+  empty-name, duplicate-name, case-equivalent-name, allocated, and unavailable
+  variants. Register fabric servers as `netbox-42` and `netbox-43`; no server
+  is registered under a raw NetBox device name. Include a replacement device
+  with a new ID that reuses the old raw name.
 - **Action:**
-  1. Exercise FindFreeHost and paginated exact-name validation against each
-     pinned Community release; capture raw name-query results.
-  2. Rename the duplicate through the fixture administrator API and retry.
-  3. Save the unique candidate's complete binding before claiming it, then rename it through the
-     administrator API to exercise contract-violation recovery. Restart the
-     adapter and attempt assignment recovery and authorized release.
-- **Expected:** Duplicate exact names prevent selection/claim even if only
-  one matches capabilities; the case-equivalent variant is also rejected.
-  Raw name-filter results demonstrate case-insensitive equality, while the
-  near-name decoy is excluded. After
-  correction, the returned name is unchanged and BackendID is the selected
-  numeric ID. Renamed assignment returns an identity error without creating
-  a new BMH. Release GET/PATCH targets the original numeric ID, observes owner
-  and cleanup guards, and clears only that claim. OSAC never writes device names.
+  1. Exercise FindFreeHost against each pinned Community release and capture
+     the returned IDs and derived host names across list pages.
+  2. Change or clear `device.name`, then retry selection and same-owner
+     assignment/release.
+  3. Save the binding for ID `42`, delete that device through the fixture
+     administrator API, restart the adapter, and attempt recovery and release.
+- **Expected:** Named, empty, duplicate, and case-equivalent NetBox names do
+  not alter ID-derived names: ID `42` always maps to `netbox-42`, and ID `43`
+  maps to `netbox-43`. Name changes do not force reselection or create a new
+  BMH. Recovery and release GET/PATCH only `/api/dcim/devices/42/`; a 404
+  retains the binding/finalizer and never touches the replacement ID. OSAC
+  never writes device names.
 
 #### TC-INT-015: Community Metadata Discovery and Pool Default
 
@@ -1622,9 +1657,10 @@ capability such as `If-Match` must fail compatibility, not skip the assertion.
      the query without altering its capabilities or tags.
 - **Expected:** The first two devices match independently of tags; the third
   matches only after admin opt-in. No tag query parameter is used. OSAC
-  changes only native status and owner; pool, capability values, BMC metadata,
-  unrelated fields, and tags remain intact. Runtime credentials make no
-  schema writes or pool/capability changes. Recorded PATCH bodies contain
+  changes only native status and owner; pool, capability values, BMC
+  address/boot-MAC metadata, unrelated fields, and tags remain intact.
+  Runtime credential resolution makes no schema writes or
+  pool/capability changes. Recorded PATCH bodies contain
   exactly `status` and `custom_fields.osac_instance_id`, proving the real
   Community API preserves other fields through its partial-update merge.
 
@@ -1765,7 +1801,7 @@ backends, not test suites.
   4. No orphaned state
   5. Pool/capability values and unrelated metadata are unchanged after release
 
-#### TC-E2E-012: Unchanged Hostname Through Provisioning, Networking, and Restart
+#### TC-E2E-012: ID-Derived BMH and AAP Hostname Through Provisioning, Networking, and Restart
 
 - **Location:** Extend the patterns in
   `osac/tests/e2e/bmaas/regression/networking/test_bmaas_networking.py` and its
@@ -1773,14 +1809,19 @@ backends, not test suites.
   helpers, `bmh_namespace`, and `bmi_template` fixtures. Exercise
   the existing AAP `playbook_osac_move_network_attachment.yml` and
   `playbook_osac_query_dhcp_lease.yml`; use the configured fabric test environment.
-- **Setup:** Real NetBox device ID `42` with name `worker-01`, matching
-  capabilities/BMC metadata, and a fabric server registered as `worker-01`.
+- **Setup:** Real NetBox device ID `42` with raw name `worker-01`, matching
+  capabilities and BMC address/boot-MAC metadata; create a system-scoped OSAC
+  Secret labeled `osac.openshift.io/netbox-device-42: "true"`; use a fabric
+  server registered as `netbox-42`.
+  Also prepare an otherwise equivalent device with ID `43`, an empty name, and
+  a fabric server registered as `netbox-43`. No server is registered under a
+  raw NetBox device name.
   Configure the standard Metal3 BMaaS template, network attachments/subnets,
-  and controlled DHCP lease fixtures. No server is registered under an
-  ID-generated alias. Use the existing test-only proxy to pause the first claim
+  and controlled DHCP lease fixtures. Use the existing test-only proxy to pause the first claim
   after the BMI binding is saved, without changing production behavior.
 - **Action:**
-  1. Create a tenant BMI; wait for host ID/name/device-ID persistence. Restart
+  1. Create a tenant BMI; wait for namespace-qualified ID-derived host-ID
+     persistence. Restart
      BMF before BMH creation, release the proxy barrier, and wait for provisioning.
   2. Inspect `hostClass`, BMH name, completed AAP provisioning/network jobs,
      resolved server ports, and DHCP lease/IP results.
@@ -1789,15 +1830,20 @@ backends, not test suites.
      map to test its supported name fallback; record the job result. Also
      exercise the network playbook with `externalHostName` omitted from its
      input fixture to verify the host-ID suffix fallback, without editing the BMI.
-  4. Delete through the API and wait for network offboard, BMH/Secret deletion,
+  4. Repeat the allocation, restart, and networking flow for the unnamed
+     device; assert empty `ExternalHostName`, `externalHostID=baremetal/netbox-43`,
+     and BMH `netbox-43`.
+  5. Delete through the API and wait for network offboard, BMH/Secret deletion,
      and NetBox release. Repeat a negative fixture with a missing fabric name.
-- **Expected:** The persisted host ID is `baremetal/worker-01`, name is
-  `worker-01`, and annotation is `42`; all survive restart. `hostClass=metal3`
-  selects the existing provisioning role and finds BMH `worker-01`. Both
-  explicit hostname and suffix fallback target the same fabric server/port;
+- **Expected:** The persisted host ID is `baremetal/netbox-42`, BMH name is
+  `netbox-42`, `externalHostName` is empty, and no device-ID annotation exists;
+  all survive restart. `hostClass=metal3` selects the existing provisioning
+  role and finds the BMH. Both AAP networking playbooks resolve `netbox-42`
+  from the `externalHostID` fallback and target the same fabric server/port;
   DHCP finds the expected lease by MAC and, when no MAC is supplied, by name.
   Deletion offboards that server before normal owner-checked cleanup.
-  Missing fabric correspondence reports the existing networking failure,
+  The unnamed-device run uses the registered `netbox-43` value and BMH
+  `netbox-43`. Missing fabric correspondence reports the existing networking failure,
   never chooses a similarly named server or rewrites the device name. Remove
   all test claims/resources via their owning fixture cleanup. This configured-
   fabric scenario is required acceptance coverage, not a claim that NetBox
@@ -1997,13 +2043,13 @@ Counts refer to scenario headings, not parameter rows or claims of executed test
 | Unit | Assignment and context | 8 | Separate AllocationContext, claim-time revalidation, success, same-owner retry, race, crash recovery, ETag |
 | Unit | Release | 6 | Requester/owner UID guards, cleanup checkpoints, idempotency, 412 retry |
 | Unit | NIC discovery | 1 | Existing BMH hardware-data delegation |
-| Unit | Device naming and recovery binding | 3 | Unchanged/unique valid names, persisted numeric identity, rename/replacement recovery |
+| Unit | Device ID and recovery binding | 3 | Kubernetes-safe ID-derived names, namespace-qualified host IDs, numeric-ID recovery, device-name changes |
 | **Unit total** | **64 BMF + 1 fulfillment-service** | **65** | |
-| Integration | BMF envtest | 19 | Allocation/release, rollback, network/auth recovery, startup, metrics, matching, dynamic profiles, backend regression, persisted candidates, async cleanup, trusted annotations, atomic identity binding, release/reallocation recovery |
+| Integration | BMF envtest | 19 | Allocation/release, rollback, network/auth recovery, startup, metrics, matching, dynamic profiles, backend regression, persisted candidates, async cleanup, trusted annotations, atomic host-ID binding, release/reallocation recovery |
 | Integration | Helm render/install | 1 | File paths/mounts, Secret ownership, one-flag Metal3 wiring, namespace/RBAC/hooks, conflicts, explicit restart |
-| Integration | Real Community API | 10 | Metadata/defaults, AND, empty owners, schema, scalar types, preservation/tags, concurrency, escaping, new capabilities, name uniqueness and numeric-ID recovery |
+| Integration | Real Community API | 10 | Metadata/defaults, AND, empty owners, schema, scalar types, preservation/unrelated metadata, concurrency, escaping, new capabilities, ID identity and numeric-ID recovery |
 | **Integration total** | **19 envtest + 1 Helm + 10 real API** | **30** | |
-| E2E | Tenant workflows | 4 | Provision, release/reuse, selector matching, unchanged names through networking/DHCP/restart |
+| E2E | Tenant workflows | 4 | Provision, release/reuse, selector matching, ID-derived BMH names through networking/DHCP/restart |
 | E2E | Inventory exhaustion | 3 | Overflow recovery, indefinite retry, condition/requeue |
 | E2E | Concurrent stress | 2 | 20 requests/50 hosts and 20 requests/10 hosts |
 | E2E | Observability | 3 | Same-host race metrics, exhaustion metrics, sanitized logs |
@@ -2141,7 +2187,7 @@ the summary.
 - TC-E2E-009: Allocation Condition and Requeue on No Matching Hosts
 - TC-E2E-010: Structured Logs
 - TC-E2E-011: Concurrent Requests Exceed Available Capacity
-- TC-E2E-012: Unchanged Hostname Through Provisioning, Networking, and Restart
+- TC-E2E-012: Location-Qualified BMH and Provider Hostname Through Provisioning, Networking, and Restart
 
 ---
 
@@ -2149,8 +2195,8 @@ the summary.
 
 The NetBox adapter coordinates with the existing BMH lifecycle manager; it does not implement Metal3 power control, inspection, OS provisioning, or readiness transitions itself:
 
-- **BMC metadata extraction:** Assignment reads the exact NetBox custom fields `osac_bmc_username`, `osac_bmc_password`, `osac_bmc_address`, and `osac_boot_mac`. TC-INT-001 verifies that valid metadata reaches allocation; TC-UNIT-005 covers schema and TC-UNIT-038 covers per-device value validation before claiming.
-- **BMC Secret creation:** The adapter ensures an operator-managed Secret with the requesting owner UID and trusted tenant annotations. TC-INT-001 verifies creation; TC-INT-026 verifies metadata and isolation; TC-INT-025 verifies completed deletion before release.
+- **BMC credential resolution:** Assignment reads the NetBox BMC address and boot-MAC fields, constructs the device label `osac.openshift.io/netbox-device-<id>`, and requires exactly one matching system-scoped Secret through the OSAC Secret API. TC-INT-001 verifies label-based resolution, including reuse of one Secret for multiple devices; TC-UNIT-005 covers NetBox schema and TC-UNIT-038 covers Secret/metadata validation before claiming.
+- **BMC Secret creation:** The adapter ensures an operator-managed runtime Secret with the resolved username/password, requesting owner UID, and trusted tenant annotations. TC-INT-001 verifies creation; TC-INT-026 verifies metadata and isolation; TC-INT-025 verifies completed deletion before release while the source OSAC Secret remains.
 - **BMH lifecycle:** TC-UNIT-059 to TC-UNIT-061 and TC-INT-024 to TC-INT-026 cover AllocationContext, claim-time revalidation, UID authorization, and asynchronous cleanup. TC-INT-001 to TC-INT-003 retain create/cleanup/rollback coverage; Metal3 remains responsible for provisioning and readiness. TC-UNIT-048 verifies NIC delegation.
 
 ---
@@ -2170,7 +2216,7 @@ contract; they do not claim verification against unprovided Jira task ACs.
 | Provision/deprovision, retry/crash recovery, preparation rollback | TC-UNIT-038 to TC-UNIT-048; TC-INT-001 to TC-INT-003; TC-INT-021; TC-E2E-001 to TC-E2E-002 |
 | Administrator controls pool/capabilities; unrelated metadata survives | TC-UNIT-055; TC-INT-002; TC-INT-020; TC-E2E-001 to TC-E2E-002 |
 | Persisted context, claim revalidation, requester UID, completed cleanup, tenant annotations | TC-UNIT-059 to TC-UNIT-061; TC-INT-024 to TC-INT-026 |
-| Unchanged device name, durable numeric identity, Metal3 provisioning and hostname consumers | TC-UNIT-009; TC-UNIT-057; TC-UNIT-062 to TC-UNIT-064; TC-INT-001; TC-INT-027 to TC-INT-029; TC-E2E-012 |
+| ID-derived BMH name, durable host ID, Metal3 namespace, and AAP hostname consumers | TC-UNIT-009; TC-UNIT-057; TC-UNIT-062 to TC-UNIT-064; TC-INT-001; TC-INT-027 to TC-INT-029; TC-E2E-012 |
 | Persisted compensation/release checkpoints and immediate reallocation | TC-UNIT-047; TC-UNIT-065; TC-INT-003; TC-INT-025; TC-INT-030 |
 | Tenant transparency and cross-backend non-regression | TC-INT-012; TC-E2E-001 to TC-E2E-003 |
 | Generic no-host status, polling, capacity recovery | TC-INT-010; TC-E2E-004; TC-E2E-007 to TC-E2E-009; TC-E2E-011 |
@@ -2192,12 +2238,13 @@ contract; they do not claim verification against unprovided Jira task ACs.
   versus runtime Secrets, file-path loading, automatic Metal3 management,
   installer hooks, and explicit restart after rotation. Optional Wizard use
   follows the existing schema-only mechanism; it adds no live NetBox probe.
-- Name validation and the new internal BackendID/annotation binding require
-  implementation and runtime coverage in TC-UNIT-062 to TC-UNIT-064 and
-  TC-INT-028 to TC-INT-029. TC-UNIT-057 verifies fulfillment preserves that
-  metadata. TC-E2E-012 covers the existing AAP/fabric hostname consumers.
-  Renames and endpoint/namespace changes require draining pending/active BMIs;
-  prototype ID-generated BMHs are not renamed or rebound in place.
+- ID-derived name validation and the existing namespace-qualified host-ID
+  binding require implementation and runtime coverage in TC-UNIT-062 to
+  TC-UNIT-064 and TC-INT-028 to TC-INT-029. TC-UNIT-057 verifies fulfillment
+  preserves that host ID. TC-E2E-012 covers the existing AAP/fabric hostname
+  consumers. NetBox device-name changes do not change the BMH identity;
+  endpoint/namespace changes and migrations from the old location/name contract
+  require draining pending/active BMIs.
 - Restart-safe cleanup requires the controller-owned cleanup annotation and
   typed preparation/checkpoint errors. TC-UNIT-065 and TC-INT-003/025/030
   cover persistence failures, rollback routing, and completion after release
