@@ -3,7 +3,7 @@ title: netbox-inventory-backend
 authors:
   - Menny Aboush
 creation-date: 2026-09-10
-last-updated: 2026-09-24
+last-updated: 2026-10-04
 tracking-link: https://redhat.atlassian.net/browse/OSAC-4347
 prd: prd.md
 see-also: []
@@ -63,9 +63,6 @@ unchanged.
 - The configured NetBox token, Secret API credentials, and TLS trust material
   are provided by the Cloud Infrastructure Admin through the deployment
   configuration.
-- NetBox device names are optional metadata. The stable OSAC identity is
-  derived from the numeric device ID as netbox-<id>; endpoint or Metal3
-  namespace changes require draining affected instances.
 
 ### Non-Goals
 
@@ -105,16 +102,18 @@ their shape without contacting either service.
 Starting state: the provider has a reachable NetBox deployment and a configured
 OSAC Secret API.
 
-1. The administrator creates the required NetBox device and scalar capability
-   fields, enrolls devices with osac_managed=true, and sets their available
-   status to staged.
+1. The administrator creates the required NetBox device and separate
+   capability custom fields. For MAC-based DHCP lookup, the optional JSON
+   custom field `osac_interface_macs` maps HostType interface names to MACs,
+   for example `{"data-0":"52:54:00:aa:bb:cc"}`. The administrator enrolls
+   devices with `osac_managed=true` and sets available devices to staged.
 2. The administrator creates a system-scoped BMC Secret through the OSAC
    Secret API with username and password data and adds a device-association
    label for each device that may use it. The administrator writes the BMC
-   address and boot MAC to each corresponding NetBox device. Raw credentials
-   and Secret IDs are never entered in NetBox.
+   address and boot MAC to each corresponding NetBox device.
 3. The administrator configures the NetBox endpoint, API token, CA material,
-   Secret API endpoint, and controller credentials in the deployment values.
+   and controller credentials in deployment values. The OSAC chart supplies
+   the internal Secret API address by default.
 4. The operator validates connectivity and fixed NetBox fields when it starts.
    Capability fields are validated when they are used by a selector.
 
@@ -181,16 +180,16 @@ The NetBox backend adds:
 - REST client and startup factory wiring.
 - Authenticated Secret API resolution.
 - NetBox-specific Helm values and mounted configuration.
+- `GetHostNICs` reads inspected NIC MACs from the allocated BMH through the
+  existing BMH manager. It returns lowercase MACs as `HostNIC` values, returns
+  `(nil, nil)` when no NIC data is available, and propagates lookup errors
+  without querying NetBox.
 - Idempotent `FindFreeHost`, `AssignHost`, and `UnassignHost` operations using
   the persisted host identity and current NetBox/Kubernetes state.
 
 ## User-facing impact
 
-The tenant-facing API and UI are unchanged: tenants continue to allocate and
-release hosts through the existing BareMetalInstance workflow and do not need
-NetBox or BMC credentials. Provider onboarding creates and labels the
-system-scoped source Secret through the Secret API; OSAC resolves it during
-allocation and raw credentials are not entered in NetBox.
+The request fields, UI workflow, and BareMetalInstance status are unchanged.
 
 ## Implementation Details/Notes/Constraints
 
@@ -206,15 +205,25 @@ owner.
 | osac_instance_id | OSAC | BMI UID owning an active claim |
 | osac_bmc_address | Provider | Metal3-compatible BMC address |
 | osac_boot_mac | Provider | Boot NIC MAC address |
+| `osac_interface_macs` | Provider | Optional JSON custom field on `dcim.device`: HostType interface name → MAC |
 | Capability custom fields | Provider | Exact selector matches |
 
-Fixed fields must be associated with dcim.device, use exact filtering where
-queried, and allow unassigned values. Capability fields are separate scalar
-fields; tags and a generic JSON capability field are not used.
+Fixed custom fields use exact filtering where queried and allow unassigned
+values. Each capability has its own custom field with one value; tags and a
+generic JSON capability field are not used.
 
 Device-association labels are maintained on the system-scoped OSAC Secret, not
 on the NetBox device. Releasing a host does not remove the association; the
 provider changes it only when the credential association changes.
+
+### Network interface MAC resolution
+
+A network attachment's `interface` is a HostType name, such as `data-0`.
+During assignment, the NetBox adapter passes the optional `osac_interface_macs`
+map to BMH creation, which stores it as JSON in the BMH annotation
+`osac.openshift.io/interface-macs`. Existing IP discovery reads the annotation
+through `management.Client.GetHostInterfaceMACs`; without a mapping, DHCP uses
+the existing server-name fallback. The map need not match inspected NICs.
 
 ### Host identity
 
@@ -228,10 +237,11 @@ For NetBox device ID 42 and Metal3 namespace baremetal:
 | Runtime BMC Secret | netbox-42-bmc-secret |
 | NetBox endpoint | /api/dcim/devices/42/ |
 
-The adapter accepts only a positive canonical numeric ID and validates the
-derived Kubernetes name before persistence or resource creation. It never
-uses device.name, site, or region for identity or recovery. A foreign BMH or
-Secret with the derived name is not adopted.
+`device.name` is optional metadata; the BMH name is always `netbox-<id>`,
+derived from the numeric device ID. The adapter accepts only positive
+canonical IDs and validates the name before persistence or creation;
+`device.name`, site, and region do not affect identity or recovery. A foreign
+BMH or Secret with that name is not adopted.
 
 The controller persists ExternalHostID before claiming the device. On restart,
 the adapter parses that ID and reads the same NetBox device. A missing or
@@ -247,9 +257,11 @@ fabric inventory.
 
 The adapter uses a narrow HTTPS REST surface:
 
-- GET extras/custom-fields: paginate and validate fixed field definitions.
+- GET extras/custom-fields: paginate and validate required device and
+  capability field definitions.
 - GET dcim/devices: apply managed, status, empty-owner, and capability filters.
-- GET dcim/devices/{id}: read the current device and ETag.
+- GET dcim/devices/{id}: read the current device, ETag, and
+  `custom_fields.osac_interface_macs` when present.
 - PATCH dcim/devices/{id}: update only status and osac_instance_id with
   If-Match; credential quarantine may also include a sanitized
   `changelog_message`.
@@ -273,9 +285,9 @@ their exact response shapes are tested in testplan.md.
 The persisted selector remains a map of field names to values. Each key is
 validated against the fetched dcim.device field metadata and becomes one
 exact cf_<key> query parameter. Reserved integration fields and lookup
-suffixes are rejected. Supported initial field types are exact scalar text,
-integer, boolean, and select values. Unsupported types and invalid values
-fail closed before a candidate is claimed.
+suffixes are rejected. Supported initial field types are text, integer,
+boolean, and select values, all matched exactly. Unsupported types and invalid
+values fail closed before a candidate is claimed.
 
 The adapter validates returned devices as well as relying on server-side
 filters. Missing fields, wrong types, disabled filters, or mismatches cannot
@@ -291,16 +303,15 @@ BMF lists by the constructed device-label key and gets the single match ->
 EnsureBMCSecret creates the namespace-scoped runtime Secret -> BMH references
 the runtime Secret.
 
-The BMF uses an authenticated private Secret API client. It does not connect
-directly to Vault, Thales KMS, or another provider backend. OSAC-5618 provides
-the system-scoped Secret authorization; tenant users cannot retrieve the source
-Secret data.
+The BMF uses the authenticated private OSAC Secret API client.
 
-The source Secret data contract is username and password plus at least one
-device-association label. The values are validated, kept in memory during
-assignment, and passed to the existing manager. EnsureBMCSecret remains
-required because Metal3 expects a Kubernetes Secret named by
-BareMetalHost.spec.bmc.credentialsName.
+The source Secret stores non-empty `username` and `password` byte values in
+`data` (not as a JSON/YAML blob). Device associations are labels in
+`metadata.labels`, for example `osac.openshift.io/netbox-device-42: "true"`.
+`List` returns metadata only, so BMF calls `Get` on the unique match to receive
+`data`. REST JSON encodes these byte values as base64; gRPC returns them as
+bytes. BMF passes them to `EnsureBMCSecret`, which stores the Metal3-required
+`username` and `password` keys.
 
 The runtime Secret is operator-managed and owner-checked. It is updated or
 created only for the requesting BMI and is deleted during release. Source
@@ -336,7 +347,9 @@ Pool membership and capability changes do not block release of an owned host.
 Helm values configure:
 
 - NetBox HTTPS endpoint, API token file, and optional CA file.
-- OSAC Secret API address, controller token file, and optional CA file.
+- OSAC Secret API base URL (defaulted to
+  `https://fulfillment-internal-api:8001` by the OSAC chart and overridable in
+  deployment values), controller token file, and optional CA file.
 - The Metal3 namespace and enabled inventory backend.
 
 NetBox and Secret API credentials are mounted as files and are never written
@@ -360,9 +373,9 @@ objects are never adopted.
   BMI fields, logs, error messages, or tenant-facing responses.
 - System-scoped Secret reads require the controller's protected identity.
   Tenant users cannot retrieve, update, or delete the source Secret data.
-- NetBox communication requires HTTPS, certificate validation, redirect
-  protection, and a least-privilege API token that can read required metadata
-  and update device allocation fields only.
+- NetBox access requires HTTPS, certificate validation, and redirect
+  protection. Its least-privilege token reads device records and custom-field
+  definitions, and updates device allocation fields only.
 - Selector keys, query parameters, IDs, and API responses are validated and
   sanitized before use or logging.
 - The controller writes no tenant name or namespace to NetBox. The owner value
@@ -373,6 +386,7 @@ objects are never adopted.
 | Failure | Behavior |
 |---|---|
 | Missing or invalid fixed NetBox fields | Startup or assignment fails closed; no broad fallback query |
+| Missing or unavailable HostType-to-MAC mapping | DHCP uses the existing server-name fallback |
 | Missing, ambiguous, or malformed Secret | If still staged and unowned, set status `failed` with a sanitized changelog message; no claim, BMH, or runtime Secret |
 | Secret API outage or access configuration failure | No NetBox status change; bounded retry/reconciliation backoff |
 | NetBox 401/403 | Permanent request error with a sanitized admin-facing diagnostic |
@@ -458,7 +472,7 @@ recovery. Rejected.
 
 Tags and a JSON blob require encoding or client-side matching and do not
 preserve the existing selector key/value contract as directly as separate
-scalar custom fields. Rejected.
+custom fields, each holding one value. Rejected.
 
 ### Separate sidecar backend
 
@@ -472,15 +486,16 @@ The complete scenario inventory and requirement traceability are in
 [testplan.md](testplan.md). The design retains only the coverage summary:
 
 - Unit tests cover NetBox schema/query construction, exact selector matching,
-  device-label Secret resolution, exactly-one matching, pre-claim quarantine
-  behavior, ETag races, and safe logging.
+  optional `osac_interface_macs` mapping and empty-map behavior, device-label
+  Secret resolution, pre-claim quarantine, ETag races, and safe logging.
 - Integration tests cover BMF reconciliation with NetBox and Metal3 mocks,
   persisted host identity, same-owner recovery, cleanup ordering, and runtime
   Secret/BMH ownership.
-- E2E tests cover provider onboarding, valid system-scoped Secret resolution,
-  one Secret associated with multiple devices, missing/ambiguous credential
-  quarantine, administrator recovery, concurrent tenant allocations,
-  deallocation, restart recovery, and real NetBox API behavior.
+- E2E tests cover provider onboarding, HostType interface mapping through DHCP,
+  valid system-scoped Secret resolution, one Secret associated with multiple
+  devices, missing/ambiguous credential quarantine, administrator recovery,
+  concurrent tenant allocations, deallocation, restart recovery, and real
+  NetBox API behavior.
 
 The missing, ambiguous, or malformed Secret cases must prove that the device is
 quarantined without a claim, runtime Secret, or BMH. Transient Secret API
@@ -504,10 +519,11 @@ provider to create the NetBox fields and system-scoped Secrets with device
 labels before enabling the backend. OSAC does not import raw credentials or
 earlier Secret associations from any NetBox prototype.
 
-To switch away from NetBox, stop new allocation, drain NetBox-backed BMIs, wait
-for BMH/runtime Secret cleanup, verify that managed devices have no owner, and
-then change the backend configuration. Do not rewrite live ExternalHostID
-values or rename BMHs in place. Source OSAC Secrets are retained or retired by
+Before disabling NetBox or switching its URL to a different inventory, stop
+new allocations, drain pending/active NetBox-backed BMIs, wait for
+BMH/runtime Secret cleanup, and verify that managed devices in the old
+inventory have no owner. Then change the backend configuration. Do not rewrite
+live ExternalHostID values or rename BMHs in place. Source OSAC Secrets are retained or retired by
 the provider's normal secret lifecycle.
 
 ## Version Skew Strategy
