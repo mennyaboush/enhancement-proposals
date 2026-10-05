@@ -29,7 +29,7 @@ fixtures unless a scenario explicitly changes them:
 | `osac_managed` | Optional Boolean (`required=false`), default `false`, exact filtering; eligible devices explicitly set JSON `true` | Cloud Infrastructure Admin controls pool membership |
 | `osac_instance_id` | Optional text, no nonempty default, exact filtering; missing, `null`, or `""` denotes no owner | OSAC claims and clears the owner |
 | `osac_bmc_address`, `osac_boot_mac` | Pre-created text fields containing valid BMC and boot data | Provider/platform admin supplies the connection metadata |
-| `osac_interface_macs` | Optional JSON object, e.g. `{"data-0":"52:54:00:aa:bb:cc"}` | Provider maps HostType interface names to DHCP MACs |
+| `osac_interface_macs` | Optional JSON object, e.g. `{"data-0":"52:54:00:aa:bb:cc"}` | Provider maps `BareMetalInstanceType.network_ports[].name` values to DHCP MACs and keeps the mapping stable while a BMI is allocated |
 | `cpu_cores`, `memory_gb` | Integer, exact filtering; JSON `16`, `128` | Administrator supplies capabilities |
 | `gpu_model` | Text, exact filtering; `"a100"` | Administrator supplies capabilities |
 
@@ -190,10 +190,14 @@ retain that binding, while confirmed reselection clears it.
 
 NetBox inventory returns `HostClass=metal3`; the existing provisioning role
 uses the namespace-qualified `externalHostID` for BMH lookup. Both AAP network
-playbooks use the same ID-derived name because `externalHostName` is empty and
-their existing fallback takes the final segment of `externalHostID`. A
-hostname-based fabric must register `netbox-42`; DHCP uses a mapped MAC
-when available and retains its existing server-name fallback.
+playbooks use the ID-derived host name because `externalHostName` is empty.
+For IP discovery, the controller reads `osac_interface_macs` from NetBox by the
+persisted `externalHostID`, resolves the selected
+`BareMetalInstanceType.network_ports[].name`, and supplies its MAC to DHCP
+discovery without storing the map on the BMH. The key also matches AAP's
+`logical_interface_name`; providers keep it stable until BMI release. Name-based
+DHCP fallback requires the provider to register the ID-derived fabric name
+and is covered by TC-E2E-012.
 
 ## Testing Infrastructure & Patterns
 
@@ -1019,17 +1023,22 @@ client. No external dependencies.
 
 ### NIC Discovery and Interface-MAC Mapping
 
-#### TC-UNIT-048: BMH NIC Data and NetBox Interface-MAC Annotation
+#### TC-UNIT-048: Resolve Interface MACs from NetBox for IP Discovery
 
-- **Setup:** The BMH manager fixture returns inspected NIC data. Use the standard
-  NetBox device fixture with `osac_interface_macs`, and a variant without it.
-- **Action:** Call `GetHostNICs(...)`; assign both device variants and inspect the
-  BMH creation parameters.
-- **Expected:** `GetHostNICs` returns lowercased MACs from BMH hardware without a
-  NetBox NIC lookup. Assignment writes the optional map to the BMH's
-  `osac.openshift.io/interface-macs` annotation when present and omits it when
-  absent. It does not compare the map with inspected NICs.
-- **Note:** If the BMH has no hardware data yet, return `(nil, nil)`.
+- **Setup:** Persist `externalHostID=baremetal/netbox-42`; the NetBox fixture
+  for device `42` has an optional `osac_interface_macs` entry for `data-0`, and
+  a variant without the field. The BMH manager returns hardware NIC MACs only.
+- **Action:** Reconcile IP discovery for an attachment with
+  `interface=data-0`; capture the inventory lookup and IP-discovery inputs.
+- **Expected:** The attachment interface, NetBox map key, and AAP
+  `logical_interface_name` all match `data-0`. BMF reads the map using the
+  persisted `externalHostID`, resolves that interface, and supplies its MAC
+  for DHCP discovery. It does not read or write the map through a BMH
+  annotation. Without the optional field, discovery receives no mapped MAC;
+  TC-E2E-012 verifies name fallback only when the provider registers the name.
+- **Note:** `GetHostNICs` returns MACs without interface names and cannot
+  substitute for the NetBox map. If the BMH has no hardware data yet, return
+  `(nil, nil)`.
 
 ### Device ID and Recovery Binding
 
@@ -1815,8 +1824,9 @@ backends, not test suites.
   helpers, `bmh_namespace`, and `bmi_template` fixtures. Exercise
   the existing AAP `playbook_osac_move_network_attachment.yml` and
   `playbook_osac_query_dhcp_lease.yml`; use the configured fabric test environment.
-- **Setup:** Real NetBox device ID `42` with raw name `worker-01`, matching
-  capabilities, BMC address/boot-MAC metadata, and
+- **Setup:** Define a `BareMetalInstanceType` with
+  `network_ports[].name=data-0`. Create real NetBox device `42` with raw name
+  `worker-01`, matching capabilities, BMC address/boot-MAC metadata, and
   `custom_fields.osac_interface_macs={"data-0":"52:54:00:aa:bb:cc"}`; create a
   system-scoped OSAC Secret labeled `osac.openshift.io/netbox-device-42: "true"`;
   use a fabric server registered as `netbox-42`.
@@ -1832,29 +1842,33 @@ backends, not test suites.
      persistence. Restart
      BMF before BMH creation, release the proxy barrier, and wait for provisioning.
   2. Inspect `hostClass`, BMH name, completed AAP provisioning/network jobs,
-     resolved server ports, and DHCP lease/IP results.
-  3. For device `42`, verify DHCP resolves the lease using the mapped MAC.
-     Exercise the network playbook with `externalHostName` omitted to verify
-     the existing host-ID suffix fallback, without editing the BMI.
+     resolved `logical_interface_name` and server ports, DHCP lease/IP results,
+     and confirm no interface-MAC map is stored on the BMH.
+  3. For device `42`, verify the controller reads the map by persisted
+     `externalHostID`, resolves `data-0`, and DHCP matches the mapped MAC.
+     Exercise the network playbook with `externalHostName` omitted.
   4. Repeat the allocation, restart, and networking flow for device `43` without
-     `osac_interface_macs`; verify the DHCP name fallback and assert empty
-     `ExternalHostName`, `externalHostID=baremetal/netbox-43`, and BMH `netbox-43`.
-  5. Delete through the API and wait for network offboard, BMH/Secret deletion,
-     and NetBox release. Repeat a negative fixture with a missing fabric name.
+     `osac_interface_macs`; verify registered-name fallback works and assert
+     empty `ExternalHostName`, `externalHostID=baremetal/netbox-43`, and BMH
+     `netbox-43`.
+  5. Remove the matching `netbox-43` IPAM lease entry while retaining the
+     port-move fixture; verify name fallback fails. Then delete through the API
+     and wait for network offboard, BMH/Secret deletion, and NetBox release.
 - **Expected:** The persisted host ID is `baremetal/netbox-42`, BMH name is
-  `netbox-42`, `externalHostName` is empty, and no device-ID annotation exists;
-  all survive restart. `hostClass=metal3` selects the existing provisioning
-  role and finds the BMH. Both AAP networking playbooks resolve `netbox-42`
-  from the `externalHostID` fallback and target the same fabric server/port.
-  DHCP uses the mapped MAC for device `42` and the existing server-name fallback
-  for device `43`, whose mapping is absent. Deletion offboards that server before
-  normal owner-checked cleanup.
-  The unnamed-device run uses the registered `netbox-43` value and BMH
-  `netbox-43`. Missing fabric correspondence reports the existing networking failure,
-  never chooses a similarly named server or rewrites the device name. Remove
-  all test claims/resources via their owning fixture cleanup. This configured-
-  fabric scenario is required acceptance coverage, not a claim that NetBox
-  requires a particular fabric product in every deployment.
+  `netbox-42`, `externalHostName` is empty, and no device-ID or interface-MAC
+  annotation exists; all survive restart. `hostClass=metal3` selects the existing
+  provisioning role and finds the BMH. Both AAP networking playbooks resolve
+  `netbox-42` from the `externalHostID` fallback and target the same fabric
+  server/port. AAP receives `logical_interface_name=data-0`, matching the
+  attachment and NetBox map key. IP discovery reads the map from NetBox by
+  persisted `externalHostID` and resolves the same mapped MAC across restart
+  for device `42`. For device `43`, the absent map uses name fallback only while
+  the registered-name IPAM lease exists.
+  Removing that lease makes discovery fail without selecting a similar name or
+  rewriting host identity. Deletion offboards the server before normal
+  owner-checked cleanup. Remove all test resources through their owning fixtures.
+  This configured-fabric scenario is required acceptance coverage, not a claim
+  that NetBox requires a particular fabric product in every deployment.
 
 #### TC-E2E-003: Custom-Field Host Matching in Tenant Workflow
 
@@ -2049,7 +2063,7 @@ Counts refer to scenario headings, not parameter rows or claims of executed test
 | Unit | Pool and status filtering | 4 | Managed Boolean, availability, owner, pagination |
 | Unit | Assignment and context | 8 | Separate AllocationContext, claim-time revalidation, success, same-owner retry, race, crash recovery, ETag |
 | Unit | Release | 6 | Requester/owner UID guards, cleanup checkpoints, idempotency, 412 retry |
-| Unit | NIC and interface-MAC annotation | 1 | BMH hardware data; optional NetBox field propagation |
+| Unit | NIC and interface-MAC resolution | 1 | NetBox map lookup by persisted host ID; selected-MAC handoff; no BMH annotation |
 | Unit | Device ID and recovery binding | 3 | Kubernetes-safe ID-derived names, namespace-qualified host IDs, numeric-ID recovery, device-name changes |
 | **Unit total** | **64 BMF + 1 fulfillment-service** | **65** | |
 | Integration | BMF envtest | 19 | Allocation/release, rollback, network/auth recovery, startup, metrics, matching, dynamic profiles, backend regression, persisted candidates, async cleanup, trusted annotations, atomic host-ID binding, release/reallocation recovery |
@@ -2129,7 +2143,7 @@ the summary.
 - TC-UNIT-045: Idempotent Retry — Already Unassigned
 - TC-UNIT-046: Ownership Guard — BMH Belongs to Different Instance
 - TC-UNIT-047: 412 During Unassignment — Retry from Read
-- TC-UNIT-048: BMH NIC Data and NetBox Interface-MAC Annotation
+- TC-UNIT-048: Resolve Interface MACs from NetBox for IP Discovery
 - TC-UNIT-049: Paginated Metadata Discovery and Wire Shapes
 - TC-UNIT-050: Refresh Capability Schema on Every Search
 - TC-UNIT-051: Invalid Requested Schema Is Not Empty Capacity
@@ -2204,7 +2218,7 @@ The NetBox adapter coordinates with the existing BMH lifecycle manager; it does 
 
 - **BMC credential resolution:** Assignment reads the NetBox BMC address and boot-MAC fields, constructs the device label `osac.openshift.io/netbox-device-<id>`, and requires exactly one matching system-scoped Secret through the OSAC Secret API. TC-INT-001 verifies label-based resolution, including reuse of one Secret for multiple devices; TC-UNIT-005 covers NetBox schema and TC-UNIT-038 covers Secret/metadata validation before claiming.
 - **BMC Secret creation:** The adapter ensures an operator-managed runtime Secret with the resolved username/password, requesting owner UID, and trusted tenant annotations. TC-INT-001 verifies creation; TC-INT-026 verifies metadata and isolation; TC-INT-025 verifies completed deletion before release while the source OSAC Secret remains.
-- **BMH lifecycle:** TC-UNIT-059 to TC-UNIT-061 and TC-INT-024 to TC-INT-026 cover AllocationContext, claim-time revalidation, UID authorization, and asynchronous cleanup. TC-INT-001 to TC-INT-003 retain create/cleanup/rollback coverage; Metal3 remains responsible for provisioning and readiness. TC-UNIT-048 verifies BMH NIC data and propagation of the optional NetBox MAC map.
+- **BMH lifecycle:** TC-UNIT-059 to TC-UNIT-061 and TC-INT-024 to TC-INT-026 cover AllocationContext, claim-time revalidation, UID authorization, and asynchronous cleanup. TC-INT-001 to TC-INT-003 retain create/cleanup/rollback coverage; Metal3 remains responsible for provisioning and readiness. TC-UNIT-048 verifies the NetBox map is resolved during IP discovery without BMH propagation.
 
 ---
 
@@ -2224,7 +2238,7 @@ contract; they do not claim verification against unprovided Jira task ACs.
 | Administrator controls pool/capabilities; unrelated metadata survives | TC-UNIT-055; TC-INT-002; TC-INT-020; TC-E2E-001 to TC-E2E-002 |
 | Persisted context, claim revalidation, requester UID, completed cleanup, tenant annotations | TC-UNIT-059 to TC-UNIT-061; TC-INT-024 to TC-INT-026 |
 | ID-derived BMH name, durable host ID, Metal3 namespace, and AAP hostname consumers | TC-UNIT-009; TC-UNIT-057; TC-UNIT-062 to TC-UNIT-064; TC-INT-001; TC-INT-027 to TC-INT-029; TC-E2E-012 |
-| HostType interface MAC mapping and existing DHCP fallback | TC-UNIT-048; TC-E2E-012 |
+| BMaaS interface-name/MAC mapping and registered-name DHCP fallback | TC-UNIT-048; TC-E2E-012 |
 | Persisted compensation/release checkpoints and immediate reallocation | TC-UNIT-047; TC-UNIT-065; TC-INT-003; TC-INT-025; TC-INT-030 |
 | Tenant transparency and cross-backend non-regression | TC-INT-012; TC-E2E-001 to TC-E2E-003 |
 | Generic no-host status, polling, capacity recovery | TC-INT-010; TC-E2E-004; TC-E2E-007 to TC-E2E-009; TC-E2E-011 |

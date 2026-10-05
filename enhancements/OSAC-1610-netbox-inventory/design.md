@@ -104,7 +104,8 @@ OSAC Secret API.
 
 1. The administrator creates the required NetBox device and separate
    capability custom fields. For MAC-based DHCP lookup, the optional JSON
-   custom field `osac_interface_macs` maps HostType interface names to MACs,
+   custom field `osac_interface_macs` maps
+   `BareMetalInstanceType.network_ports[].name` values to MACs,
    for example `{"data-0":"52:54:00:aa:bb:cc"}`. The administrator enrolls
    devices with `osac_managed=true` and sets available devices to staged.
 2. The administrator creates a system-scoped BMC Secret through the OSAC
@@ -170,10 +171,14 @@ contract is extended as follows:
   it before claiming the device.
 - `UnassignHost` receives the BMI UID so NetBox can verify ownership before
   cleanup and release.
+- The inventory client exposes the optional NetBox interface-to-MAC map by
+  persisted `ExternalHostID` for IP discovery; the BMF controller resolves the
+  attachment interface and supplies its MAC to DHCP discovery without writing
+  the map to the BMH.
 
-`ExternalHostID` is passed to both methods as the resource identity. Existing
-controller finalizer and retry behavior handles recovery from the persisted BMI
-fields and current resource state.
+The lifecycle methods receive `ExternalHostID` as the resource identity.
+Existing controller finalizer and retry behavior handles recovery from the
+persisted BMI fields and current resource state.
 
 The NetBox backend adds:
 
@@ -182,8 +187,9 @@ The NetBox backend adds:
 - NetBox-specific Helm values and mounted configuration.
 - `GetHostNICs` reads inspected NIC MACs from the allocated BMH through the
   existing BMH manager. It returns lowercase MACs as `HostNIC` values, returns
-  `(nil, nil)` when no NIC data is available, and propagates lookup errors
-  without querying NetBox.
+  `(nil, nil)` when no NIC data is available, and propagates lookup errors.
+  These MACs have no interface names, so IP discovery uses the NetBox mapping
+  to resolve the selected attachment port.
 - Idempotent `FindFreeHost`, `AssignHost`, and `UnassignHost` operations using
   the persisted host identity and current NetBox/Kubernetes state.
 
@@ -205,7 +211,7 @@ owner.
 | osac_instance_id | OSAC | BMI UID owning an active claim |
 | osac_bmc_address | Provider | Metal3-compatible BMC address |
 | osac_boot_mac | Provider | Boot NIC MAC address |
-| `osac_interface_macs` | Provider | Optional JSON custom field on `dcim.device`: HostType interface name → MAC |
+| `osac_interface_macs` | Provider | Optional JSON custom field on `dcim.device`: `BareMetalInstanceType.network_ports[].name` → MAC |
 | Capability custom fields | Provider | Exact selector matches |
 
 Fixed custom fields use exact filtering where queried and allow unassigned
@@ -218,12 +224,13 @@ provider changes it only when the credential association changes.
 
 ### Network interface MAC resolution
 
-A network attachment's `interface` is a HostType name, such as `data-0`.
-During assignment, the NetBox adapter passes the optional `osac_interface_macs`
-map to BMH creation, which stores it as JSON in the BMH annotation
-`osac.openshift.io/interface-macs`. Existing IP discovery reads the annotation
-through `management.Client.GetHostInterfaceMACs`; without a mapping, DHCP uses
-the existing server-name fallback. The map need not match inspected NICs.
+A network attachment's `interface` comes from
+`BareMetalInstanceType.network_ports[].name`. The same name is passed to AAP as
+`logical_interface_name` and keys `osac_interface_macs`. During IP discovery,
+the BMF controller reads the map from NetBox using the persisted
+`ExternalHostID`, resolves the selected interface, and supplies its MAC to DHCP
+discovery; it does not copy the map onto the BMH. Providers keep the mapping
+unchanged while a BMI is allocated so retries resolve the same port.
 
 ### Host identity
 
@@ -248,10 +255,11 @@ the adapter parses that ID and reads the same NetBox device. A missing or
 malformed device retains the binding for repair; it is never replaced by a
 lookup using a mutable name.
 
-The existing AAP fallback uses the final segment of ExternalHostID when
-ExternalHostName is empty, so networking and DHCP hostname lookup use the same
-netbox-<id> value. The provider registers that value in any hostname-based
-fabric inventory.
+AAP uses the final `ExternalHostID` segment as fabric `host_name` when
+`ExternalHostName` is empty; the provider registers `netbox-<id>` for port
+moves. DHCP discovery matches the selected interface by MAC. Name-based lease
+fallback requires the provider to register that same name in the fabric; this
+is covered by TC-E2E-012.
 
 ### NetBox REST contract
 
@@ -386,7 +394,7 @@ objects are never adopted.
 | Failure | Behavior |
 |---|---|
 | Missing or invalid fixed NetBox fields | Startup or assignment fails closed; no broad fallback query |
-| Missing or unavailable HostType-to-MAC mapping | DHCP uses the existing server-name fallback |
+| Missing or unavailable interface-MAC map | Use registered-name fallback; fail if the fabric name is absent |
 | Missing, ambiguous, or malformed Secret | If still staged and unowned, set status `failed` with a sanitized changelog message; no claim, BMH, or runtime Secret |
 | Secret API outage or access configuration failure | No NetBox status change; bounded retry/reconciliation backoff |
 | NetBox 401/403 | Permanent request error with a sanitized admin-facing diagnostic |
@@ -491,11 +499,12 @@ The complete scenario inventory and requirement traceability are in
 - Integration tests cover BMF reconciliation with NetBox and Metal3 mocks,
   persisted host identity, same-owner recovery, cleanup ordering, and runtime
   Secret/BMH ownership.
-- E2E tests cover provider onboarding, HostType interface mapping through DHCP,
-  valid system-scoped Secret resolution, one Secret associated with multiple
-  devices, missing/ambiguous credential quarantine, administrator recovery,
-  concurrent tenant allocations, deallocation, restart recovery, and real
-  NetBox API behavior.
+- E2E tests cover provider onboarding, BareMetalInstanceType interface-to-MAC
+  mapping and registered-name fallback through DHCP, valid system-scoped
+  Secret resolution, one Secret associated with multiple devices,
+  missing/ambiguous credential quarantine, administrator recovery, concurrent
+  tenant allocations, deallocation, restart recovery, and real NetBox API
+  behavior.
 
 The missing, ambiguous, or malformed Secret cases must prove that the device is
 quarantined without a claim, runtime Secret, or BMH. Transient Secret API
