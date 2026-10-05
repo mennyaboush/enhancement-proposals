@@ -2,7 +2,7 @@
 
 ## Status
 
-- Rounds completed: 3
+- Rounds completed: 6
 - Open gaps: 0
 - Exit criteria met: Yes
 
@@ -103,22 +103,75 @@ No hardcoded mapping table is needed. Field schemas and scalar types must be
 validated, and older tag-based selectors require explicit migration. Design,
 test plan, and PRD assumptions use this same contract.
 
-## Round 3 — Unchanged Device Names and Configuration (2026-09-22)
+## Historical Round 3 — Unchanged Device Names and Configuration (2026-09-22; superseded by D9)
 
-### Decision (D6)
+### Historical Decision (D6 — superseded by D9)
 
-Use the existing NetBox device name unchanged as the BMH name and return
-`<Metal3 namespace>/<device.name>` as the host ID, following the BCM naming
-pattern. Do not generate a prefixed name from the numeric device ID.
+Preserve the existing NetBox device name unchanged as the provider/fabric
+hostname. The earlier proposal also used it as the BMH name; that identity
+mapping is superseded by D7 below.
 [User direction]
 
 ### Implementation impact for local review
 
-The design validates names and uniqueness, persists the separate numeric
-device ID with the host ID/name before claiming, and uses the original ID
-for recovery and release. Provider fabric names must agree, and live renames
-require a drain. These safeguards and their internal annotation/Go fields are
-implementation proposals supporting D6, not previously existing behavior.
+The earlier design validated names and uniqueness, persisted the separate
+numeric device ID with the host ID/name before claiming, and used the original
+ID for recovery and release. Those safeguards remain, while D7 separates the
+Kubernetes BMH name from the provider hostname.
+
+## Historical Round 4 — Location-Qualified BMH Identity (2026-09-23; superseded by D9)
+
+### Historical Decision (D7 — superseded by D9)
+
+Generate a deterministic BMH name from the native NetBox region path, site
+slug, and effective provider hostname, with a fixed alphabetic `bmh-` prefix.
+The effective hostname is the exact nonempty `device.name`, or
+`netbox-<numeric-id>` when the NetBox name is empty/null. Persist it as
+`ExternalHostName` for provider/fabric and DHCP lookups. Use the configured
+`options.metal3.namespace` for every NetBox-backed BMH and operator-managed BMC
+Secret. Persist the generated host ID, effective provider name, and numeric
+NetBox device ID before claiming.
+
+The final BMH name is validated by a centralized NetBox-adapter helper using
+Kubernetes' `IsDNS1035Label`; it must be a lowercase, 1–63 character label
+starting with a letter. There is no existing reusable BMF helper: BCM's private
+pattern allows leading digits and remains BCM-specific. Empty provider names
+use the current `netbox-<id>` fallback and the BMH form
+`bmh-<region>-<site>-netbox-<id>`. Hostname-based fabric integrations must
+register the effective fallback; OSAC does not create or rename fabric entries.
+
+Generated names must be unique, case-insensitively, across all devices visible
+to the OSAC token, including allocated/unavailable devices, because they share
+one Metal3 namespace. The same effective provider names in different locations
+are allowed when the generated names differ; the same region/site/effective-name
+combination, including across NetBox tenants, is rejected. Different effective
+names or hyphenated location components that produce the same joined name are
+also rejected; the adapter must validate the complete visible device list, not
+only same-name results.
+
+### Impact
+
+D7 supersedes the BMH-name portion of D6 and the related old test expectations.
+Numeric device IDs remain the recovery/release identity and NetBox endpoint
+selector. Nonempty NetBox names are never modified; an empty name uses the
+deterministic fallback. Effective hostname, location, and Metal3 endpoint or
+namespace changes require draining pending and active BMIs.
+
+## Historical Round 5 — Empty Device Names (2026-09-23; superseded by D9)
+
+### Historical Decision (D8 — superseded by D9)
+
+`device.name` is optional for an enrolled NetBox device. The adapter resolves
+the effective provider hostname as the exact `device.name` when present, or
+`netbox-<id>` when it is empty/null. The same value is stored in
+`ExternalHostName` and is used as the final component of the generated BMH
+name, for example `bmh-region-1-site-a-netbox-42`. The numeric ID remains a
+separate backend identity for NetBox REST operations and recovery.
+
+If the fabric performs hostname lookup, the provider must register the
+effective hostname, including the `netbox-<id>` fallback. OSAC does not create
+fabric entries. A change between an empty name and a nonempty name is an
+effective identity change and requires reselection or a drain.
 
 Persisted cleanup intent and resource-absence checkpoints prevent retries
 from recreating resources during rollback and allow an old BMI to finish
@@ -133,14 +186,47 @@ permissions, and explicit restart after configuration or credential updates.
 These are local responses to configuration review feedback, not reviewer
 approval or published resolutions.
 
+## Round 6 — ID-Derived Host Identity and AAP Networking (2026-09-23)
+
+### Decision (D9)
+
+Use the numeric NetBox device ID as the single canonical OSAC host identity for
+both named and unnamed devices. For device ID `42` and configured Metal3
+namespace `baremetal`, the existing host-ID contract is
+`baremetal/netbox-42`, and the BMH name is `netbox-42`. Persist only
+`spec.externalHostID`; remove the proposed `BackendID` field and device-ID
+annotation. Leave `spec.externalHostName` empty for the NetBox backend so the
+existing AAP networking and DHCP fallback derives `netbox-42` from the final
+host-ID segment.
+
+The Metal3 namespace remains in `externalHostID` because the existing
+`namespace/name` contract is consumed by Metal3 management and the AAP
+provisioning/deprovisioning roles. It scopes the Kubernetes object; it is not a
+second NetBox identity. `device.name`, site, and region are not used for
+Kubernetes naming, uniqueness, recovery, or networking lookup. A fabric that
+uses hostname lookup must register `netbox-<id>`; MAC-based DHCP behavior is
+unchanged.
+
+### Impact
+
+D9 supersedes D6, D7, and D8 for host identity, BMH naming, and provider
+hostname behavior. No full-inventory name scan, location-qualified name
+generation, `ExternalHostName` persistence, `BackendID`, or device-ID
+annotation is required. A change to `device.name` does not require reselection
+or a drain. A device replacement with a new NetBox ID requires draining its
+BMI. Switching the configured NetBox URL to a different inventory requires
+draining affected BMIs because their saved host IDs do not record the source
+NetBox instance.
+
 ## Summary
 
-Six locked decisions:
+Nine decisions (D6–D8 are superseded by D9):
 - **D1:** Transparent NetBox backend; tenants use standard API.
 - **D2:** In-tree backend, Helm + Enclave Wizard config.
 - **D3:** Reuse NetBox native status field for state.
 - **D4:** NetBox inventory-only; OS provisioning orthogonal.
 - **D5:** Custom fields for pool membership and capability equality; preserve selector values and use only NetBox Community features.
-- **D6:** Preserve the NetBox device name as the BMH name; namespace-qualify it for OSAC's host ID.
+- **D6–D8:** Superseded for host identity and name handling by D9.
+- **D9:** Use `netbox-<numeric-id>` as the canonical BMH and provider lookup name for every device; persist it through the existing namespace-qualified `externalHostID`, keep `externalHostName` empty, and retain the configured Metal3 namespace for the shared `namespace/name` consumer contract.
 
 No remaining gaps blocking design phase.
