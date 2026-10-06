@@ -171,10 +171,9 @@ contract is extended as follows:
   it before claiming the device.
 - `UnassignHost` receives the BMI UID so NetBox can verify ownership before
   cleanup and release.
-- The inventory client exposes the optional NetBox interface-to-MAC map by
-  persisted `ExternalHostID` for IP discovery; the BMF controller resolves the
-  attachment interface and supplies its MAC to DHCP discovery without writing
-  the map to the BMH.
+- NetBox implements the shared `inventory.Client.GetHostLogicalPortMACs`
+  contract proposed by [OSAC-5810 / PR #1423](https://github.com/osac-project/osac/pull/1423).
+  Its mapping source and DHCP fallback behavior are described below.
 
 The lifecycle methods receive `ExternalHostID` as the resource identity.
 Existing controller finalizer and retry behavior handles recovery from the
@@ -185,11 +184,8 @@ The NetBox backend adds:
 - REST client and startup factory wiring.
 - Authenticated Secret API resolution.
 - NetBox-specific Helm values and mounted configuration.
-- `GetHostNICs` reads inspected NIC MACs from the allocated BMH through the
-  existing BMH manager. It returns lowercase MACs as `HostNIC` values, returns
-  `(nil, nil)` when no NIC data is available, and propagates lookup errors.
-  These MACs have no interface names, so IP discovery uses the NetBox mapping
-  to resolve the selected attachment port.
+- `GetHostNICs` populates BMI hardware status from BMH inspection data; DHCP
+  uses `GetHostLogicalPortMACs` separately.
 - Idempotent `FindFreeHost`, `AssignHost`, and `UnassignHost` operations using
   the persisted host identity and current NetBox/Kubernetes state.
 
@@ -224,13 +220,17 @@ provider changes it only when the credential association changes.
 
 ### Network interface MAC resolution
 
-A network attachment's `interface` comes from
-`BareMetalInstanceType.network_ports[].name`. The same name is passed to AAP as
-`logical_interface_name` and keys `osac_interface_macs`. During IP discovery,
-the BMF controller reads the map from NetBox using the persisted
-`ExternalHostID`, resolves the selected interface, and supplies its MAC to DHCP
-discovery; it does not copy the map onto the BMH. Providers keep the mapping
-unchanged while a BMI is allocated so retries resolve the same port.
+`BareMetalNetworkAttachment.interface` selects a
+`BareMetalInstanceType.network_ports[].name`; AAP uses that name as
+`logical_interface_name`. NetBox implements `GetHostLogicalPortMACs` by reading
+`custom_fields.osac_interface_macs` by persisted `ExternalHostID`. The method
+returns an empty map when the field is absent and an error when the NetBox read
+or JSON parsing fails. The controller supplies the selected port MAC to DHCP
+discovery and uses the existing name-based lease fallback when a mapping is
+unavailable. This extends [OSAC-1437 BMaaS networking](../OSAC-1437-bmaas-networking/design.md)
+with a NetBox mapping source while retaining MAC-first DHCP. Providers keep
+mapping values stable and in the format accepted by the fabric while a BMI is
+allocated.
 
 ### Host identity
 
@@ -255,11 +255,9 @@ the adapter parses that ID and reads the same NetBox device. A missing or
 malformed device retains the binding for repair; it is never replaced by a
 lookup using a mutable name.
 
-AAP uses the final `ExternalHostID` segment as fabric `host_name` when
-`ExternalHostName` is empty; the provider registers `netbox-<id>` for port
-moves. DHCP discovery matches the selected interface by MAC. Name-based lease
-fallback requires the provider to register that same name in the fabric; this
-is covered by TC-E2E-012.
+AAP derives `host_name` from the final `ExternalHostID` segment
+(`netbox-<id>`); the provider registers that name for port moves and
+name-based DHCP fallback. TC-E2E-012 covers the flow.
 
 ### NetBox REST contract
 
@@ -394,7 +392,7 @@ objects are never adopted.
 | Failure | Behavior |
 |---|---|
 | Missing or invalid fixed NetBox fields | Startup or assignment fails closed; no broad fallback query |
-| Missing or unavailable interface-MAC map | Use registered-name fallback; fail if the fabric name is absent |
+| Interface-MAC map absent or lookup fails | Use ID-derived name matching; retry IP discovery if no lease matches |
 | Missing, ambiguous, or malformed Secret | If still staged and unowned, set status `failed` with a sanitized changelog message; no claim, BMH, or runtime Secret |
 | Secret API outage or access configuration failure | No NetBox status change; bounded retry/reconciliation backoff |
 | NetBox 401/403 | Permanent request error with a sanitized admin-facing diagnostic |
@@ -494,8 +492,9 @@ The complete scenario inventory and requirement traceability are in
 [testplan.md](testplan.md). The design retains only the coverage summary:
 
 - Unit tests cover NetBox schema/query construction, exact selector matching,
-  optional `osac_interface_macs` mapping and empty-map behavior, device-label
-  Secret resolution, pre-claim quarantine, ETag races, and safe logging.
+  `GetHostLogicalPortMACs` valid, empty, malformed, and failed-read cases,
+  device-label Secret resolution, pre-claim quarantine, ETag races, and safe
+  logging.
 - Integration tests cover BMF reconciliation with NetBox and Metal3 mocks,
   persisted host identity, same-owner recovery, cleanup ordering, and runtime
   Secret/BMH ownership.

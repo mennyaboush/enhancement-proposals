@@ -191,13 +191,10 @@ retain that binding, while confirmed reselection clears it.
 NetBox inventory returns `HostClass=metal3`; the existing provisioning role
 uses the namespace-qualified `externalHostID` for BMH lookup. Both AAP network
 playbooks use the ID-derived host name because `externalHostName` is empty.
-For IP discovery, the controller reads `osac_interface_macs` from NetBox by the
-persisted `externalHostID`, resolves the selected
-`BareMetalInstanceType.network_ports[].name`, and supplies its MAC to DHCP
-discovery without storing the map on the BMH. The key also matches AAP's
-`logical_interface_name`; providers keep it stable until BMI release. Name-based
-DHCP fallback requires the provider to register the ID-derived fabric name
-and is covered by TC-E2E-012.
+For IP discovery, `GetHostLogicalPortMACs` returns this map by persisted
+`externalHostID`; the controller resolves the attachment interface and supplies
+its MAC to DHCP. An empty map or lookup error uses the existing ID-derived
+name fallback (`netbox-<id>`), covered by TC-E2E-012.
 
 ## Testing Infrastructure & Patterns
 
@@ -1023,22 +1020,17 @@ client. No external dependencies.
 
 ### NIC Discovery and Interface-MAC Mapping
 
-#### TC-UNIT-048: Resolve Interface MACs from NetBox for IP Discovery
+#### TC-UNIT-048: Resolve Logical-Port MACs Through Inventory
 
-- **Setup:** Persist `externalHostID=baremetal/netbox-42`; the NetBox fixture
-  for device `42` has an optional `osac_interface_macs` entry for `data-0`, and
-  a variant without the field. The BMH manager returns hardware NIC MACs only.
-- **Action:** Reconcile IP discovery for an attachment with
-  `interface=data-0`; capture the inventory lookup and IP-discovery inputs.
-- **Expected:** The attachment interface, NetBox map key, and AAP
-  `logical_interface_name` all match `data-0`. BMF reads the map using the
-  persisted `externalHostID`, resolves that interface, and supplies its MAC
-  for DHCP discovery. It does not read or write the map through a BMH
-  annotation. Without the optional field, discovery receives no mapped MAC;
-  TC-E2E-012 verifies name fallback only when the provider registers the name.
-- **Note:** `GetHostNICs` returns MACs without interface names and cannot
-  substitute for the NetBox map. If the BMH has no hardware data yet, return
-  `(nil, nil)`.
+- **Setup:** Persist `externalHostID=baremetal/netbox-42`. Provide NetBox
+  responses with a valid `data-0` mapping, no mapping, a mapping without
+  `data-0`, malformed mapping data, and a failed device read.
+- **Action:** Call `GetHostLogicalPortMACs` by the saved host ID and reconcile
+  IP discovery for an attachment with `interface=data-0`.
+- **Expected:** A valid map supplies the `data-0` MAC to DHCP discovery. An
+  absent map returns an empty map; malformed data and failed reads return
+  errors. For empty or error results, IP discovery uses the existing
+  name-based lease fallback. AAP receives `logical_interface_name=data-0`.
 
 ### Device ID and Recovery Binding
 
@@ -1830,9 +1822,8 @@ backends, not test suites.
   `custom_fields.osac_interface_macs={"data-0":"52:54:00:aa:bb:cc"}`; create a
   system-scoped OSAC Secret labeled `osac.openshift.io/netbox-device-42: "true"`;
   use a fabric server registered as `netbox-42`.
-  Also prepare an equivalent device with ID `43`, an empty name, no
-  `osac_interface_macs` field, and a fabric server registered as `netbox-43`.
-  No server is registered under a raw NetBox device name.
+  Also prepare device `43` with an empty NetBox name, no mapping, and a fabric
+  server registered as `netbox-43`.
   Configure the standard Metal3 BMaaS template, a network attachment with
   `interface=data-0`, subnets, and controlled DHCP lease fixtures. Use the
   existing test-only proxy to pause the first claim after the BMI binding is
@@ -1842,33 +1833,23 @@ backends, not test suites.
      persistence. Restart
      BMF before BMH creation, release the proxy barrier, and wait for provisioning.
   2. Inspect `hostClass`, BMH name, completed AAP provisioning/network jobs,
-     resolved `logical_interface_name` and server ports, DHCP lease/IP results,
-     and confirm no interface-MAC map is stored on the BMH.
+     resolved `logical_interface_name` and server ports, and DHCP lease/IP
+     results.
   3. For device `42`, verify the controller reads the map by persisted
      `externalHostID`, resolves `data-0`, and DHCP matches the mapped MAC.
-     Exercise the network playbook with `externalHostName` omitted.
-  4. Repeat the allocation, restart, and networking flow for device `43` without
-     `osac_interface_macs`; verify registered-name fallback works and assert
-     empty `ExternalHostName`, `externalHostID=baremetal/netbox-43`, and BMH
-     `netbox-43`.
-  5. Remove the matching `netbox-43` IPAM lease entry while retaining the
-     port-move fixture; verify name fallback fails. Then delete through the API
-     and wait for network offboard, BMH/Secret deletion, and NetBox release.
-- **Expected:** The persisted host ID is `baremetal/netbox-42`, BMH name is
-  `netbox-42`, `externalHostName` is empty, and no device-ID or interface-MAC
-  annotation exists; all survive restart. `hostClass=metal3` selects the existing
-  provisioning role and finds the BMH. Both AAP networking playbooks resolve
-  `netbox-42` from the `externalHostID` fallback and target the same fabric
-  server/port. AAP receives `logical_interface_name=data-0`, matching the
-  attachment and NetBox map key. IP discovery reads the map from NetBox by
-  persisted `externalHostID` and resolves the same mapped MAC across restart
-  for device `42`. For device `43`, the absent map uses name fallback only while
-  the registered-name IPAM lease exists.
-  Removing that lease makes discovery fail without selecting a similar name or
-  rewriting host identity. Deletion offboards the server before normal
-  owner-checked cleanup. Remove all test resources through their owning fixtures.
-  This configured-fabric scenario is required acceptance coverage, not a claim
-  that NetBox requires a particular fabric product in every deployment.
+     Exercise AAP with `netbox-42` resolved from `externalHostID`.
+  4. Repeat allocation, restart, and networking for device `43`; verify AAP
+     derives `netbox-43` from the saved host ID and discovers its registered-name
+     DHCP lease.
+  5. Remove the `netbox-43` lease while retaining the port-move fixture; verify
+     IP discovery retries until the lease is available. Then delete through the
+     API and wait for network offboard, BMH/Secret deletion, and NetBox release.
+- **Expected:** Across restart, device `42` remains bound as
+  `baremetal/netbox-42`, creates BMH `netbox-42`, and uses `hostClass=metal3`.
+  IP discovery resolves `data-0` from NetBox and matches its DHCP lease by MAC.
+  Device `43` uses the ID-derived `netbox-43` name when its mapping is absent;
+  discovery retries while its matching lease is unavailable. Deletion offboards
+  networking before owner-checked BMH/Secret cleanup and NetBox release.
 
 #### TC-E2E-003: Custom-Field Host Matching in Tenant Workflow
 
@@ -2063,7 +2044,7 @@ Counts refer to scenario headings, not parameter rows or claims of executed test
 | Unit | Pool and status filtering | 4 | Managed Boolean, availability, owner, pagination |
 | Unit | Assignment and context | 8 | Separate AllocationContext, claim-time revalidation, success, same-owner retry, race, crash recovery, ETag |
 | Unit | Release | 6 | Requester/owner UID guards, cleanup checkpoints, idempotency, 412 retry |
-| Unit | NIC and interface-MAC resolution | 1 | NetBox map lookup by persisted host ID; selected-MAC handoff; no BMH annotation |
+| Unit | NIC and interface-MAC resolution | 1 | NetBox map lookup by persisted host ID; selected-MAC handoff to DHCP |
 | Unit | Device ID and recovery binding | 3 | Kubernetes-safe ID-derived names, namespace-qualified host IDs, numeric-ID recovery, device-name changes |
 | **Unit total** | **64 BMF + 1 fulfillment-service** | **65** | |
 | Integration | BMF envtest | 19 | Allocation/release, rollback, network/auth recovery, startup, metrics, matching, dynamic profiles, backend regression, persisted candidates, async cleanup, trusted annotations, atomic host-ID binding, release/reallocation recovery |
@@ -2143,7 +2124,7 @@ the summary.
 - TC-UNIT-045: Idempotent Retry — Already Unassigned
 - TC-UNIT-046: Ownership Guard — BMH Belongs to Different Instance
 - TC-UNIT-047: 412 During Unassignment — Retry from Read
-- TC-UNIT-048: Resolve Interface MACs from NetBox for IP Discovery
+- TC-UNIT-048: Resolve Logical-Port MACs Through Inventory
 - TC-UNIT-049: Paginated Metadata Discovery and Wire Shapes
 - TC-UNIT-050: Refresh Capability Schema on Every Search
 - TC-UNIT-051: Invalid Requested Schema Is Not Empty Capacity
@@ -2218,7 +2199,7 @@ The NetBox adapter coordinates with the existing BMH lifecycle manager; it does 
 
 - **BMC credential resolution:** Assignment reads the NetBox BMC address and boot-MAC fields, constructs the device label `osac.openshift.io/netbox-device-<id>`, and requires exactly one matching system-scoped Secret through the OSAC Secret API. TC-INT-001 verifies label-based resolution, including reuse of one Secret for multiple devices; TC-UNIT-005 covers NetBox schema and TC-UNIT-038 covers Secret/metadata validation before claiming.
 - **BMC Secret creation:** The adapter ensures an operator-managed runtime Secret with the resolved username/password, requesting owner UID, and trusted tenant annotations. TC-INT-001 verifies creation; TC-INT-026 verifies metadata and isolation; TC-INT-025 verifies completed deletion before release while the source OSAC Secret remains.
-- **BMH lifecycle:** TC-UNIT-059 to TC-UNIT-061 and TC-INT-024 to TC-INT-026 cover AllocationContext, claim-time revalidation, UID authorization, and asynchronous cleanup. TC-INT-001 to TC-INT-003 retain create/cleanup/rollback coverage; Metal3 remains responsible for provisioning and readiness. TC-UNIT-048 verifies the NetBox map is resolved during IP discovery without BMH propagation.
+- **BMH lifecycle:** TC-UNIT-059 to TC-UNIT-061 and TC-INT-024 to TC-INT-026 cover AllocationContext, claim-time revalidation, UID authorization, and asynchronous cleanup. TC-INT-001 to TC-INT-003 retain create/cleanup/rollback coverage; Metal3 remains responsible for provisioning and readiness. TC-UNIT-048 verifies selected-MAC handoff to DHCP discovery.
 
 ---
 
