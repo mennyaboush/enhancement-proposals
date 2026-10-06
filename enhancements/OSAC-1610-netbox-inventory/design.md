@@ -184,8 +184,8 @@ The NetBox backend adds:
 - REST client and startup factory wiring.
 - Authenticated Secret API resolution.
 - NetBox-specific Helm values and mounted configuration.
-- `GetHostNICs` populates BMI hardware status from BMH inspection data; DHCP
-  uses `GetHostLogicalPortMACs` separately.
+- `GetHostNICs` populates BMI hardware status from BMH inspection data
+- `GetHostLogicalPortMACs` maps the logical NIC names and MAC addresses
 - Idempotent `FindFreeHost`, `AssignHost`, and `UnassignHost` operations using
   the persisted host identity and current NetBox/Kubernetes state.
 
